@@ -1,5 +1,5 @@
 [package]
-name = "binaries"
+name = "orderbook-server"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -8,9 +8,9 @@ publish = false
 server = { path = "../server" }
 env_logger = "0.11.8"
 tokio = { version = "1", features = ["full"] }
-futures-util = "0.3.31"
-tokio-tungstenite = "0.27.0"
 clap = { version = "4.5.42", features = ["derive"] }
+axum = "0.8.4"
+log = "0.4"
 
 [lints]
 workspace = true

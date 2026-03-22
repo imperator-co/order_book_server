@@ -1,5 +1,5 @@
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
     prelude::*,
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -17,10 +17,6 @@ impl<O> Snapshots<O> {
         Self(value)
     }
 
-    pub(crate) const fn as_ref(&self) -> &HashMap<Coin, Snapshot<O>> {
-        &self.0
-    }
-
     pub(crate) fn value(self) -> HashMap<Coin, Snapshot<O>> {
         self.0
     }
@@ -34,6 +30,11 @@ pub(crate) struct OrderBooks<O> {
 impl<O: InnerOrder> OrderBooks<O> {
     pub(crate) const fn as_ref(&self) -> &BTreeMap<Coin, OrderBook<O>> {
         &self.order_books
+    }
+
+    /// Total number of orders across all orderbooks
+    pub(crate) fn order_count(&self) -> usize {
+        self.order_books.values().map(|book| book.order_count()).sum()
     }
     #[must_use]
     pub(crate) fn from_snapshots(snapshot: Snapshots<O>, ignore_triggers: bool) -> Self {
@@ -52,12 +53,33 @@ impl<O: InnerOrder> OrderBooks<O> {
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
-        self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
+        if let Some(book) = self.order_books.get_mut(&coin) {
+            let success = book.cancel_order(oid.clone());
+            if !success {
+                // oid not found in this coin's book
+                log::debug!("cancel_order: oid {:?} not found in {:?} book", oid, coin);
+            }
+            success
+        } else {
+            // coin book doesn't exist
+            log::debug!("cancel_order: no book for coin {:?}", coin);
+            false
+        }
     }
 
     // change size to reflect how much gets matched during the block
     pub(crate) fn modify_sz(&mut self, oid: Oid, coin: Coin, sz: Sz) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.modify_sz(oid, sz))
+    }
+
+    /// Get BBO for specific coins only - faster for selective broadcast
+    /// Only computes BBO for coins in the set, avoiding iteration over all coins
+    #[must_use]
+    pub(crate) fn get_bbos_for_coins(
+        &self,
+        coins: &std::collections::HashSet<Coin>,
+    ) -> HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)> {
+        coins.iter().filter_map(|coin| self.order_books.get(coin).map(|book| (coin.clone(), book.get_bbo()))).collect()
     }
 }
 
@@ -69,13 +91,15 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
-pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
+/// Load snapshots from CLI-generated JSON (without height prefix)
+/// Height is read separately from visor_abci_state.json
+pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
     #[allow(clippy::type_complexity)]
-    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
+    let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_str(str)?;
     Ok((
         height,
         Snapshots::new(
@@ -91,13 +115,23 @@ where
     ))
 }
 
-pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
+/// Load snapshots from CLI-generated JSON file + height from visor state
+pub(crate) async fn load_snapshots_from_cli_json<O, R>(
+    snapshot_path: &Path,
+    visor_state_path: &Path,
+) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
-    let file_contents = read_to_string(path).await?;
-    load_snapshots_from_str(&file_contents)
+    // Read height from visor_abci_state.json
+    let visor_state = read_to_string(visor_state_path).await?;
+    let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
+    let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
+
+    // Read snapshot
+    let file_contents = read_to_string(snapshot_path).await?;
+    load_snapshots_from_cli_str(&file_contents, height)
 }
 
 #[cfg(test)]
@@ -106,7 +140,7 @@ mod tests {
         order_book::{
             InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
             levels::build_l2_level,
-            multi_book::{Coin, Snapshots, load_snapshots_from_json, load_snapshots_from_str},
+            multi_book::{Coin, Snapshots},
         },
         prelude::*,
         types::{
@@ -116,7 +150,40 @@ mod tests {
     };
     use alloy::primitives::Address;
     use itertools::Itertools;
-    use std::{fs::create_dir_all, path::PathBuf};
+    use serde::{Deserialize, Serialize};
+    use std::{collections::HashMap, fs::create_dir_all, path::PathBuf};
+    use tokio::fs::read_to_string;
+
+    fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
+    where
+        O: TryFrom<R, Error = crate::prelude::Error>,
+        R: Serialize + for<'a> Deserialize<'a>,
+    {
+        #[allow(clippy::type_complexity)]
+        let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
+        Ok((
+            height,
+            Snapshots::new(
+                snapshot
+                    .into_iter()
+                    .map(|(coin, [bids, asks])| {
+                        let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+                        let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+                        Ok((Coin::new(&coin), Snapshot([bids, asks])))
+                    })
+                    .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
+            ),
+        ))
+    }
+
+    async fn load_snapshots_from_json<O, R>(path: &PathBuf) -> Result<(u64, Snapshots<O>)>
+    where
+        O: TryFrom<R, Error = crate::prelude::Error>,
+        R: Serialize + for<'a> Deserialize<'a>,
+    {
+        let file_contents = read_to_string(path).await?;
+        load_snapshots_from_str(&file_contents)
+    }
 
     #[must_use]
     fn snapshot_to_l2_snapshot<O: InnerOrder>(

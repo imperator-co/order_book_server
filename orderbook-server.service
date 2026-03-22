@@ -1,0 +1,30 @@
+[Unit]
+Description=Hyperliquid Orderbook WebSocket Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/root/order_book_server/target/release/orderbook_server \
+    --address 0.0.0.0 \
+    --port 8000 \
+    --compression-level 1 \
+    --markets all \
+    --snapshot-mode docker \
+    --docker-container hyperliquid_hlnode \
+    --data-dir /root/.hyperliquid_sentry/volumes/hl/data \
+    --metrics-port 9090 \
+    --log-level info
+
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orderbook-server
+
+[Install]
+WantedBy=multi-user.target

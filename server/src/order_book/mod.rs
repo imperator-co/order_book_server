@@ -59,6 +59,11 @@ impl<O: InnerOrder> OrderBook<O> {
         Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new() }
     }
 
+    /// Number of orders in this orderbook
+    pub(crate) fn order_count(&self) -> usize {
+        self.oid_to_side_px.len()
+    }
+
     pub(crate) fn add_order(&mut self, mut order: O) {
         let (maker_orders, resting_book) = match order.side() {
             Side::Ask => (&mut self.bids, &mut self.asks),
@@ -93,6 +98,10 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 
     pub(crate) fn modify_sz(&mut self, oid: Oid, sz: Sz) -> bool {
+        // If new size is 0, remove the order entirely
+        if sz.is_zero() {
+            return self.cancel_order(oid);
+        }
         if let Some((side, px)) = self.oid_to_side_px.get(&oid) {
             let map = match side {
                 Side::Ask => &mut self.asks,
@@ -109,6 +118,29 @@ impl<O: InnerOrder> OrderBook<O> {
             }
         }
         false
+    }
+
+    /// Get best bid and best ask in O(1) without computing full L2 snapshot.
+    /// Returns (best_bid, best_ask) where each is (price, total_size, order_count).
+    #[must_use]
+    pub(crate) fn get_bbo(&self) -> (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>) {
+        // Best bid = highest price in bids (last key in BTreeMap)
+        let best_bid = self.bids.last_key_value().map(|(px, list)| {
+            let orders = list.to_vec();
+            let total_sz = orders.iter().map(|o| o.sz().value()).sum::<u64>();
+            let count = orders.len() as u32;
+            (*px, Sz::new(total_sz), count)
+        });
+
+        // Best ask = lowest price in asks (first key in BTreeMap)
+        let best_ask = self.asks.first_key_value().map(|(px, list)| {
+            let orders = list.to_vec();
+            let total_sz = orders.iter().map(|o| o.sz().value()).sum::<u64>();
+            let count = orders.len() as u32;
+            (*px, Sz::new(total_sz), count)
+        });
+
+        (best_bid, best_ask)
     }
 
     // we go by the convention that prioritized orders go first in the vector; this makes aggregation step later easier.

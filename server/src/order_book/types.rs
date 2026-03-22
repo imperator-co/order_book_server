@@ -77,8 +77,20 @@ impl Coin {
         self.0.clone()
     }
 
+    /// Returns true for spot markets: @ prefixed coins and PURR/USDC
     pub(crate) fn is_spot(&self) -> bool {
         self.0.starts_with('@') || self.0 == "PURR/USDC"
+    }
+
+    /// Returns true for HIP-3 markets: coins with colon format (X:Y)
+    /// Examples: flx:COIN, xyz:AMD, abc:XYZ
+    pub(crate) fn is_hip3(&self) -> bool {
+        self.0.contains(':')
+    }
+
+    /// Returns true for perpetual futures (not spot, not hip3)
+    pub(crate) fn is_perp(&self) -> bool {
+        !self.is_spot() && !self.is_hip3()
     }
 }
 

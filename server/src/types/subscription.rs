@@ -1,4 +1,7 @@
-use crate::types::{L2Book, L4Book, Trade};
+use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
+use crate::types::node_data::NodeDataOrderStatus;
+use crate::types::{Bbo, L2Book, L4Book, Trade};
+use alloy::primitives::Address;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -12,6 +15,7 @@ pub(crate) const DEFAULT_LEVELS: usize = 20;
 pub(crate) enum ClientMessage {
     Subscribe { subscription: Subscription },
     Unsubscribe { subscription: Subscription },
+    Ping,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -24,6 +28,10 @@ pub(crate) enum Subscription {
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
     L4Book { coin: String },
+    #[serde(rename_all = "camelCase")]
+    Bbo { coin: String },
+    #[serde(rename_all = "camelCase")]
+    OrderUpdates { user: String },
 }
 
 impl Subscription {
@@ -31,7 +39,7 @@ impl Subscription {
         match self {
             Self::Trades { coin } => universe.contains(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
-                if !universe.contains(coin) || coin.starts_with('@') {
+                if !universe.contains(coin) {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }
@@ -61,15 +69,56 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
-            Self::L4Book { coin } => {
-                if !universe.contains(coin) || coin.starts_with('@') {
+            Self::L4Book { coin } | Self::Bbo { coin } => {
+                if !universe.contains(coin) {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }
                 info!("Valid subscription");
                 true
             }
+            Self::OrderUpdates { user } => {
+                // Validate the user address format (must be valid hex address)
+                if user.len() != 42 || !user.starts_with("0x") {
+                    info!("Invalid subscription: user address must be 42 characters starting with 0x");
+                    return false;
+                }
+                if user[2..].chars().any(|c| !c.is_ascii_hexdigit()) {
+                    info!("Invalid subscription: user address contains invalid hex characters");
+                    return false;
+                }
+                info!("Valid orderUpdates subscription for user: {}", user);
+                true
+            }
         }
+    }
+}
+
+impl Subscription {
+    pub(crate) const fn type_label(&self) -> &str {
+        match self {
+            Self::Bbo { .. } => "bbo",
+            Self::L2Book { .. } => "l2Book",
+            Self::L4Book { .. } => "l4Book",
+            Self::Trades { .. } => "trades",
+            Self::OrderUpdates { .. } => "orderUpdates",
+        }
+    }
+}
+
+/// Order update for a specific user - streams raw order status data
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrderUpdate {
+    pub user: Address,
+    pub time: u64,
+    pub height: u64,
+    pub order_status: NodeDataOrderStatus,
+}
+
+impl OrderUpdate {
+    pub(crate) fn new(user: Address, time: u64, height: u64, order_status: NodeDataOrderStatus) -> Self {
+        Self { user, time, height, order_status }
     }
 }
 
@@ -81,6 +130,9 @@ pub(crate) enum ServerResponse {
     L2Book(L2Book),
     L4Book(L4Book),
     Trades(Vec<Trade>),
+    Bbo(Bbo),
+    OrderUpdates(Vec<OrderUpdate>),
+    Pong,
     Error(String),
 }
 
@@ -91,15 +143,33 @@ pub(crate) struct SubscriptionManager {
 
 impl SubscriptionManager {
     pub(crate) fn subscribe(&mut self, sub: Subscription) -> bool {
-        self.subscriptions.insert(sub)
+        let label = sub.type_label().to_owned();
+        let inserted = self.subscriptions.insert(sub);
+        if inserted {
+            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[&label]).inc();
+        }
+        inserted
     }
 
     pub(crate) fn unsubscribe(&mut self, sub: Subscription) -> bool {
-        self.subscriptions.remove(&sub)
+        let label = sub.type_label().to_owned();
+        let removed = self.subscriptions.remove(&sub);
+        if removed {
+            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[&label]).dec();
+        }
+        removed
     }
 
     pub(crate) const fn subscriptions(&self) -> &HashSet<Subscription> {
         &self.subscriptions
+    }
+}
+
+impl Drop for SubscriptionManager {
+    fn drop(&mut self) {
+        for sub in &self.subscriptions {
+            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[sub.type_label()]).dec();
+        }
     }
 }
 
@@ -130,7 +200,7 @@ mod test {
     #[test]
     fn test_message_deserialization_trade() {
         let message = r#"
-            {"channel":"trades","data":[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"users":["0xcc0a3b6e3267c84361e91d8230868eea53431e4b","0xc64cc00b46101bd40aa1c3121195e85c0b0918d8"]}]}
+            {"channel":"trades","data":[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"user":"0xcc0a3b6e3267c84361e91d8230868eea53431e4b"}]}
         "#;
         let msg: ServerResponse = serde_json::from_str(message).unwrap();
         assert!(matches!(msg, ServerResponse::Trades(_)));
@@ -148,5 +218,27 @@ mod test {
                 subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
             }
         ));
+    }
+
+    #[test]
+    fn test_order_updates_subscription_deserialization() {
+        let message = r#"
+            { "method": "subscribe", "subscription":{ "type": "orderUpdates", "user": "0xABc1234567890abcDEF1234567890AbCdEf12345" }}
+        "#;
+        let msg: ClientMessage = serde_json::from_str(message).unwrap();
+        assert!(matches!(msg, ClientMessage::Subscribe { subscription: Subscription::OrderUpdates { .. } }));
+        if let ClientMessage::Subscribe { subscription: Subscription::OrderUpdates { user } } = msg {
+            assert_eq!(user, "0xABc1234567890abcDEF1234567890AbCdEf12345");
+        }
+    }
+
+    #[test]
+    fn test_ping_pong() {
+        let message = r#"{ "method": "ping" }"#;
+        let msg: ClientMessage = serde_json::from_str(message).unwrap();
+        assert!(matches!(msg, ClientMessage::Ping));
+
+        let response = serde_json::to_string(&ServerResponse::Pong).unwrap();
+        assert_eq!(response, r#"{"channel":"pong"}"#);
     }
 }

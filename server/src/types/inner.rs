@@ -141,21 +141,23 @@ impl From<InnerL4Order> for L4Order {
             cloid,
         } = value;
         let limit_px = limit_px.to_str();
-        let sz = sz.to_str();
+        let sz_str = sz.to_str();
         Self {
             user: Some(user),
             coin: coin.value(),
             side,
             limit_px,
-            sz,
+            sz: sz_str.clone(),
             oid,
             timestamp,
             trigger_condition,
             is_trigger,
             trigger_px,
+            children: Vec::new(),
             is_position_tpsl,
             reduce_only,
             order_type,
+            orig_sz: sz_str,
             tif,
             cloid,
         }
@@ -185,14 +187,8 @@ impl From<InnerLevel> for Level {
 
 #[derive(Debug, Clone)]
 pub(crate) enum InnerOrderDiff {
-    New {
-        sz: Sz,
-    },
-    #[allow(dead_code)]
-    Update {
-        orig_sz: Sz,
-        new_sz: Sz,
-    },
+    New { sz: Sz },
+    Update { _orig_sz: Sz, new_sz: Sz },
     Remove,
 }
 
@@ -203,7 +199,7 @@ impl TryFrom<OrderDiff> for InnerOrderDiff {
         Ok(match value {
             OrderDiff::New { sz } => Self::New { sz: Sz::parse_from_str(&sz)? },
             OrderDiff::Update { orig_sz, new_sz } => {
-                Self::Update { orig_sz: Sz::parse_from_str(&orig_sz)?, new_sz: Sz::parse_from_str(&new_sz)? }
+                Self::Update { _orig_sz: Sz::parse_from_str(&orig_sz)?, new_sz: Sz::parse_from_str(&new_sz)? }
             }
             OrderDiff::Remove => Self::Remove,
         })
