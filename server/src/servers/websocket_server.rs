@@ -98,13 +98,16 @@ async fn heartbeat_tick(ticker: &mut Option<tokio::time::Interval>) {
 }
 
 pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
-    // Broadcast channel buffer. Each buffered Snapshot now holds Arc'd inner maps
-    // shared across receivers, so deep cloning is no longer the cost - but a slow
-    // receiver still pins one Arc<InternalMessage> per buffered slot. 32 is well
-    // above the steady-state queue depth and keeps worst-case transient memory bounded.
-    // Slow receivers fall into the existing `RecvError::Lagged` shedding path
-    // (CHANNEL_DROPS_TOTAL is incremented).
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(32);
+    // One channel multiplexes every event (L2/BBO/L4/fills) to all connections.
+    // In `--stream-with-block-info` mode the listener emits one message per node
+    // event (order statuses/diffs: thousands/s), so depth 32 drained in
+    // milliseconds and any consumer jitter tripped `RecvError::Lagged`, evicting
+    // messages across all channels. Even with batch draining and shared frames,
+    // a single trades subscriber lost ~71% of trades on a busy mainnet window at
+    // depth 32 vs ~1.7% at 16384, in the same conditions. 16384 gives seconds of
+    // headroom; each slot is one Arc pointer and a persistently-slow consumer
+    // still sheds via Lagged, so memory stays bounded.
+    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
 
     // Market filter flags from config
     let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
