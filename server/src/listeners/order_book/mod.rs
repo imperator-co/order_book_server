@@ -4,10 +4,10 @@ use crate::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
         FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE, ORDERBOOK_COINS_COUNT,
         ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
-        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
-        Coin, Px, Snapshot, Sz,
+        Coin, Px, Side, Snapshot, Sz,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
     },
     prelude::*,
@@ -125,6 +125,10 @@ pub(crate) struct OrderBookListener {
     // for bounding losses whose exact height is unknown (watcher discards).
     last_seen_height: u64,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    // Pairs fill legs into public-schema trades; holds at most the one leg
+    // awaiting its counterpart across Fills batches (single-event batches in
+    // --stream-with-block-info mode).
+    trade_pairer: TradePairer,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
     // Incremental L2 snapshot cache. Each per-coin entry is Arc'd and shared with
@@ -171,6 +175,7 @@ impl OrderBookListener {
             max_loss_height: 0,
             last_seen_height: 0,
             internal_message_tx,
+            trade_pairer: TradePairer::default(),
             last_l2_broadcast: None,
             l2_snapshot_cache: HashMap::new(),
             pending_dirty_l2_coins: HashSet::new(),
@@ -505,16 +510,50 @@ impl L2FrameCache {
 
 /// Group a fills batch into per-coin trade vectors. Consumes the batch (fills
 /// are never applied to the book), so this is move-only - no event is cloned.
-fn group_fills_by_coin(batch: Batch<NodeDataFill>) -> HashMap<String, CoinTrades> {
-    let mut by_coin: HashMap<String, Vec<Trade>> = HashMap::new();
-    for fill in batch.events() {
-        let trade = Trade::from_single_fill(fill);
-        by_coin.entry(trade.coin.clone()).or_default().push(trade);
+/// Pairs the two fill legs of each trade match into one public-schema print,
+/// grouped per coin for broadcast.
+///
+/// A match produces two fill records (buyer + seller) sharing a `tid`. The
+/// node emits them as immediate neighbours in the fills stream — adjacent
+/// within a block, and in `--stream-with-block-info` mode as two consecutive
+/// single-event `Fills` batches. So pairing only needs to remember the single
+/// previous leg: when the next leg shares its `tid` they form a trade;
+/// otherwise the previous leg was unpairable and is dropped. This is O(1) per
+/// fill, allocates nothing beyond the output, and cannot leak — at most one
+/// leg is ever held.
+///
+/// Dropped legs are counted in `TRADES_UNPAIRED_FILLS_TOTAL` — ~0 in steady
+/// state; growth means the node stopped emitting the two legs of a match
+/// adjacently and pairing should be revisited.
+#[derive(Default)]
+struct TradePairer {
+    prev: Option<NodeDataFill>,
+}
+
+impl TradePairer {
+    fn group(&mut self, batch: Batch<NodeDataFill>) -> HashMap<String, CoinTrades> {
+        let mut by_coin: HashMap<String, Vec<Trade>> = HashMap::new();
+        for fill in batch.events() {
+            match self.prev.take() {
+                Some(prev) if prev.1.tid == fill.1.tid => {
+                    let (bid, ask) = if fill.1.side == Side::Bid { (fill, prev) } else { (prev, fill) };
+                    if let Some(trade) = Trade::from_fills(bid, ask) {
+                        by_coin.entry(trade.coin.clone()).or_default().push(trade);
+                    }
+                }
+                Some(_) => {
+                    // Previous leg never met its counterpart: unpairable, drop it.
+                    TRADES_UNPAIRED_FILLS_TOTAL.inc();
+                    self.prev = Some(fill);
+                }
+                None => self.prev = Some(fill),
+            }
+        }
+        by_coin
+            .into_iter()
+            .map(|(coin, trades)| (coin, CoinTrades { trades: Arc::new(trades), frame: SharedFrame::new() }))
+            .collect()
     }
-    by_coin
-        .into_iter()
-        .map(|(coin, trades)| (coin, CoinTrades { trades: Arc::new(trades), frame: SharedFrame::new() }))
-        .collect()
 }
 
 /// Group order diffs per coin (one clone per event - the batch itself is
@@ -715,10 +754,10 @@ impl OrderBookListener {
                     EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
                     // Broadcast fills grouped per coin (move-only - the batch is
                     // never applied to the book, so no event is cloned).
-                    if let Some(tx) = &self.internal_message_tx {
-                        if tx.receiver_count() > 0 {
-                            let trades_by_coin = group_fills_by_coin(batch);
-                            if !trades_by_coin.is_empty() {
+                    if self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0) {
+                        let trades_by_coin = self.trade_pairer.group(batch);
+                        if !trades_by_coin.is_empty() {
+                            if let Some(tx) = &self.internal_message_tx {
                                 drop(tx.send(Arc::new(InternalMessage::Fills { trades_by_coin })));
                             }
                         }
@@ -1562,22 +1601,26 @@ mod tests {
 
     // ==================== Per-coin fan-out grouping ====================
 
+    /// One complete match per listed coin: two adjacent fill legs (buyer bid +
+    /// seller ask) sharing a `tid`. The pairer reduces each pair to one trade.
     fn make_fills_batch(coins: &[&str], height: u64) -> Batch<NodeDataFill> {
-        let events: Vec<serde_json::Value> = coins
-            .iter()
-            .enumerate()
-            .map(|(i, coin)| {
-                serde_json::json!([
-                    "0x0000000000000000000000000000000000000001",
-                    {
-                        "coin": coin, "px": "100.0", "sz": "1.0", "side": "A",
-                        "time": 1_700_000_000_000_u64, "startPosition": "0", "dir": "Open Long",
-                        "closedPnl": "0", "hash": "0xabc", "oid": i, "crossed": true,
-                        "fee": "0.5", "tid": i, "feeToken": "USDC"
-                    }
-                ])
-            })
-            .collect();
+        let leg = |coin: &str, tid: usize, side: &str, crossed: bool, user: &str| {
+            serde_json::json!([
+                user,
+                {
+                    "coin": coin, "px": "100.0", "sz": "1.0", "side": side,
+                    "time": 1_700_000_000_000_u64, "startPosition": "0", "dir": "Open Long",
+                    "closedPnl": "0", "hash": "0xabc", "oid": tid, "crossed": crossed,
+                    "fee": "0.5", "tid": tid, "feeToken": "USDC"
+                }
+            ])
+        };
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        for (i, coin) in coins.iter().enumerate() {
+            // Buyer is the taker (bid crossed); legs adjacent, sharing tid = i.
+            events.push(leg(coin, i, "B", true, "0x0000000000000000000000000000000000000001"));
+            events.push(leg(coin, i, "A", false, "0x0000000000000000000000000000000000000002"));
+        }
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
@@ -1621,6 +1664,13 @@ mod tests {
                 assert_eq!(trades_by_coin.len(), 2);
                 assert_eq!(trades_by_coin.get("BTC").map(|t| t.trades.len()), Some(2));
                 assert_eq!(trades_by_coin.get("ETH").map(|t| t.trades.len()), Some(1));
+                // Public schema: aggressing side (buyer taker => "B") + users
+                // [buyer, seller], no per-leg `user`.
+                let v = serde_json::to_value(&trades_by_coin["ETH"].trades[0]).unwrap();
+                assert_eq!(v["side"], "B");
+                assert_eq!(v["users"][0], "0x0000000000000000000000000000000000000001");
+                assert_eq!(v["users"][1], "0x0000000000000000000000000000000000000002");
+                assert!(v.get("user").is_none());
                 found = true;
             }
         }
@@ -1628,11 +1678,37 @@ mod tests {
     }
 
     #[test]
+    fn test_fills_pair_across_batches_hft_mode() {
+        // HFT mode: each leg is its own single-event batch. The first holds its
+        // lone leg; the second completes exactly one trade with the aggressor
+        // side taken from `crossed`.
+        let leg = |tid: u64, side: &str, crossed: bool, user: &str| -> Batch<NodeDataFill> {
+            serde_json::from_value(serde_json::json!({
+                "local_time": "2024-01-15T10:30:00.000000000",
+                "block_time": "2024-01-15T10:30:00.000000000",
+                "block_number": 1,
+                "events": [[user, {
+                    "coin": "BTC", "px": "100.0", "sz": "1.0", "side": side,
+                    "time": 1_700_000_000_000_u64, "startPosition": "0", "dir": "Open Long",
+                    "closedPnl": "0", "hash": "0xabc", "oid": tid, "crossed": crossed,
+                    "fee": "0.5", "tid": tid, "feeToken": "USDC"
+                }]]
+            })).unwrap()
+        };
+        let mut p = TradePairer::default();
+        // Seller (ask) crossed => taker => aggressor side "A".
+        assert!(p.group(leg(5, "A", true, "0x0000000000000000000000000000000000000002")).is_empty());
+        let grouped = p.group(leg(5, "B", false, "0x0000000000000000000000000000000000000001"));
+        assert_eq!(grouped["BTC"].trades.len(), 1);
+        assert_eq!(serde_json::to_value(&grouped["BTC"].trades[0]).unwrap()["side"], "A");
+    }
+
+    #[test]
     fn test_shared_frame_matches_per_connection_serialization() {
         // The wire format is public API: the shared frame must be byte-identical
         // to what the old per-connection serde_json::to_string path produced.
         use crate::types::subscription::ServerResponse;
-        let grouped = group_fills_by_coin(make_fills_batch(&["BTC"], 1));
+        let grouped = TradePairer::default().group(make_fills_batch(&["BTC"], 1));
         let ct = grouped.get("BTC").unwrap();
         let expected = serde_json::to_string(&ServerResponse::Trades(Arc::clone(&ct.trades))).unwrap();
         let frame = ct.frame.get_or_serialize(|| ServerResponse::Trades(Arc::clone(&ct.trades)));

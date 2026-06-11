@@ -19,7 +19,7 @@ pub(crate) struct Trade {
     hash: String,
     time: u64,
     tid: u64,
-    user: Address,
+    users: [Address; 2],
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -93,19 +93,32 @@ impl L2Book {
 }
 
 impl Trade {
-    /// Create a trade from a single fill (raw broadcast without pairing)
-    pub(crate) fn from_single_fill(fill: NodeDataFill) -> Self {
-        let NodeDataFill(user, fill_data) = fill;
-        Self {
-            coin: fill_data.coin,
-            side: fill_data.side,
-            px: fill_data.px,
-            sz: fill_data.sz,
-            hash: fill_data.hash,
-            time: fill_data.time,
-            tid: fill_data.tid,
-            user,
+    /// Build one trade print from the two fill legs of a match, following the
+    /// public websocket schema: `side` is the aggressing (taker) side — the
+    /// leg whose `crossed` flag is set — and `users` is `[buyer, seller]`.
+    ///
+    /// Returns `None` if the legs do not belong to the same match (coin or
+    /// trade id mismatch); callers should skip such legs rather than emit
+    /// schema-breaking output.
+    pub(crate) fn from_fills(bid: NodeDataFill, ask: NodeDataFill) -> Option<Self> {
+        let NodeDataFill(buyer, bid_fill) = bid;
+        let NodeDataFill(seller, ask_fill) = ask;
+        if bid_fill.coin != ask_fill.coin || bid_fill.tid != ask_fill.tid {
+            return None;
         }
+        // "Side is aggressing side for trades" (public API notation): the
+        // taker is the leg that crossed the spread.
+        let side = if ask_fill.crossed { Side::Ask } else { Side::Bid };
+        Some(Self {
+            coin: ask_fill.coin,
+            side,
+            px: ask_fill.px,
+            sz: ask_fill.sz,
+            hash: ask_fill.hash,
+            time: ask_fill.time,
+            tid: ask_fill.tid,
+            users: [buyer, seller],
+        })
     }
 }
 

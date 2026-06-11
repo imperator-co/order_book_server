@@ -77,6 +77,13 @@ lazy_static! {
         &["channel"]
     ).expect("metric can be created");
 
+    /// Fill legs dropped because no matching counterpart followed (trades pairing).
+    /// ~0 in steady state; growth means the node stopped emitting the two legs
+    /// of a match adjacently and trade pairing should be revisited.
+    pub static ref TRADES_UNPAIRED_FILLS_TOTAL: IntCounter = IntCounter::new(
+        "trades_unpaired_fills_total", "Fill legs dropped without a matching counterpart"
+    ).expect("metric can be created");
+
     /// WebSocket messages sent
     pub static ref MESSAGES_SENT_TOTAL: IntCounter = IntCounter::new(
         "messages_sent_total",
@@ -215,6 +222,7 @@ pub fn register_metrics() {
     // Throughput metrics
     REGISTRY.register(Box::new(EVENTS_PROCESSED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(BROADCASTS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(TRADES_UNPAIRED_FILLS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(MESSAGES_SENT_TOTAL.clone())).ok();
 
     // Health metrics

@@ -216,7 +216,7 @@ mod test {
     #[test]
     fn test_message_deserialization_trade() {
         let message = r#"
-            {"channel":"trades","data":[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"user":"0xcc0a3b6e3267c84361e91d8230868eea53431e4b"}]}
+            {"channel":"trades","data":[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"users":["0xcc0a3b6e3267c84361e91d8230868eea53431e4b","0x010461c14e146ac35fe42271bdc1134ee31c703a"]}]}
         "#;
         let msg: ServerResponse = serde_json::from_str(message).unwrap();
         assert!(matches!(msg, ServerResponse::Trades(_)));
@@ -227,7 +227,7 @@ mod test {
         // The fan-out payloads are Arc-shared across connections; serde's "rc"
         // feature must keep Arc<Vec<T>> byte-identical to Vec<T> on the wire -
         // the JSON format is part of the public API.
-        let trades_json = r#"[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"user":"0xcc0a3b6e3267c84361e91d8230868eea53431e4b"}]"#;
+        let trades_json = r#"[{"coin":"BTC","side":"A","px":"106296.0","sz":"0.00017","time":1751430933565,"hash":"0xde93a8a0729ade63d8840417805ba9010b008818422ddedb1285744426b73503","tid":293353986402527,"users":["0xcc0a3b6e3267c84361e91d8230868eea53431e4b","0x010461c14e146ac35fe42271bdc1134ee31c703a"]}]"#;
         let plain: Vec<crate::types::Trade> = serde_json::from_str(trades_json).unwrap();
         let arced: std::sync::Arc<Vec<crate::types::Trade>> = serde_json::from_str(trades_json).unwrap();
         assert_eq!(serde_json::to_string(&plain).unwrap(), serde_json::to_string(&arced).unwrap());
