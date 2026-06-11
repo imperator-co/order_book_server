@@ -20,9 +20,10 @@ pub(super) struct OrderBookState {
     // Persistent cache of OrderStatuses waiting for their New diffs
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible)
     pending_order_statuses: HashMap<Oid, NodeDataOrderStatus>,
-    // Persistent cache of New diffs (sz values) waiting for their OrderStatuses
-    // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
-    pending_new_diffs: HashMap<Oid, crate::order_book::types::Sz>,
+    // Persistent cache of New diffs (block-time + sz) waiting for their OrderStatuses.
+    // This is the other half of bidirectional caching - handles when Diff arrives
+    // BEFORE Status. The block-time stamps the half for age-based eviction.
+    pending_new_diffs: HashMap<Oid, (u64, crate::order_book::types::Sz)>,
 }
 
 impl OrderBookState {
@@ -106,37 +107,47 @@ impl OrderBookState {
         self.order_book.as_ref().len()
     }
 
-    /// Cleanup stale pending entries to prevent unbounded memory growth
-    /// Orphaned entries occur when OrderStatuses have is_inserted_into_book() = true
-    /// but their matching BookDiff never arrives (network issues, bugs, etc.)
-    /// This is a simple size-based eviction - when cache exceeds limit, replace
-    /// with a fresh `HashMap::new()` so the high-water-mark bucket capacity is
-    /// actually released (plain `.clear()` keeps the buckets allocated forever).
-    /// Also opportunistically compacts the orderbook slab allocators on the same
-    /// cadence, since both are unbounded-growth vectors that the maintenance tick
-    /// is responsible for bounding.
+    /// Evict pending order halves that can no longer pair, and report whether a
+    /// genuine stream fault occurred.
     ///
-    /// Returns `true` when a pending cache was force-cleared. Cleared entries may
-    /// include genuinely in-flight order halves, so the caller must treat this as
-    /// potential data loss and mark the book for re-sync.
+    /// A resting order is reconstructed from two records carried on separate
+    /// streams that share an `oid`: its OrderStatus and its `New` BookDiff.
+    /// Whichever arrives first waits in a pending cache for the other. The node
+    /// produces both for the *same block*, so in normal operation they pair
+    /// within milliseconds. A half left unpaired for *seconds* therefore never
+    /// had a partner coming: the order opened and never rested (immediate fill /
+    /// IOC), or the counterpart record was filtered out (e.g. a non-perp diff
+    /// under `--markets perps`). Dropping such a half leaves the book correct —
+    /// it never represented a resting order.
+    ///
+    /// So we evict by age, with a window far larger than any real inter-stream
+    /// skew (~ms). This keeps genuinely in-flight halves (whose partner is still
+    /// a block or two behind) while bounding the caches, and — crucially — it is
+    /// routine housekeeping, NOT data loss: it must not trigger a re-sync.
+    /// (The previous behaviour cleared the whole cache at a size cap and forced a
+    /// re-sync, so a steady trickle of never-pairing orphans made the node
+    /// rebuild the book from a full snapshot every few seconds.)
+    ///
+    /// Returns `true` only if, *after* age-eviction, a cache is still above a
+    /// large hard cap — a real fault (a stalled or flooding partner stream)
+    /// where a re-sync is genuinely warranted.
     pub(super) fn cleanup_stale_pending(&mut self) -> bool {
-        const MAX_PENDING_ORDERS: usize = 10_000;
-        const MAX_PENDING_DIFFS: usize = 1_000;
+        // ~100 blocks of margin over the real status<->diff arrival skew.
+        const MAX_PENDING_AGE_MS: u64 = 10_000;
+        // Age-eviction keeps the caches small in normal operation; exceeding this
+        // means the stream itself is broken, not that orphans are accumulating.
+        const HARD_CAP: usize = 200_000;
 
-        let mut cleared = false;
-        if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
-            log::warn!(
-                "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
-                self.pending_order_statuses.len()
-            );
-            self.pending_order_statuses = HashMap::new();
-            cleared = true;
-        }
+        let now = self.time;
+        let stale = |ts_ms: u64| now.saturating_sub(ts_ms) > MAX_PENDING_AGE_MS;
 
-        if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
-            self.pending_new_diffs = HashMap::new();
-            cleared = true;
+        let before = self.pending_order_statuses.len() + self.pending_new_diffs.len();
+        self.pending_order_statuses
+            .retain(|_, s| !stale(s.time.and_utc().timestamp_millis().max(0) as u64));
+        self.pending_new_diffs.retain(|_, (ts, _)| !stale(*ts));
+        let evicted = before - (self.pending_order_statuses.len() + self.pending_new_diffs.len());
+        if evicted > 0 {
+            log::debug!("Evicted {evicted} unpairable pending order half(ves) by age");
         }
 
         let compacted = self.order_book.compact_all();
@@ -144,7 +155,17 @@ impl OrderBookState {
             let (live, cap) = self.order_book.slab_stats();
             log::info!("Compacted {compacted} price-level slabs (live={live}, capacity={cap})");
         }
-        cleared
+
+        let overflow =
+            self.pending_order_statuses.len() > HARD_CAP || self.pending_new_diffs.len() > HARD_CAP;
+        if overflow {
+            log::warn!(
+                "Pending caches over hard cap after age-eviction (statuses={}, diffs={}) - stream fault, re-syncing",
+                self.pending_order_statuses.len(),
+                self.pending_new_diffs.len()
+            );
+        }
+        overflow
     }
 
     /// Get BBO for specific coins only - even faster for selective broadcast
@@ -184,7 +205,7 @@ impl OrderBookState {
             let oid = Oid::new(order_status.order.oid);
 
             // Check if there's a pending New diff for this order
-            if let Some(sz) = self.pending_new_diffs.remove(&oid) {
+            if let Some((_, sz)) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
                 let order_coin = Coin::new(&order_status.order.coin);
@@ -248,8 +269,9 @@ impl OrderBookState {
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
-                        // Status hasn't arrived yet - cache the diff size
-                        self.pending_new_diffs.insert(oid.clone(), sz);
+                        // Status hasn't arrived yet - cache the diff size, stamped
+                        // with this batch's block-time for age-based eviction.
+                        self.pending_new_diffs.insert(oid.clone(), (time, sz));
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
@@ -515,41 +537,98 @@ mod tests {
 
     // ==================== Cleanup Tests ====================
 
+    fn ts_ms(s: &str) -> u64 {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap().and_utc().timestamp_millis() as u64
+    }
+
+    fn make_order_status_at(coin: &str, oid: u64, status: &str, ts: &str) -> NodeDataOrderStatus {
+        let mut s = make_order_status(coin, oid, status);
+        s.time = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").unwrap();
+        s
+    }
+
+    // An order half left unpaired only briefly is genuinely in flight (its
+    // partner is a block or two behind): it must be KEPT and must still pair.
     #[test]
-    fn test_cleanup_stale_pending_orders() {
+    fn test_young_in_flight_half_kept_and_still_pairs() {
         let mut state = empty_state();
-        // Insert 10_001 pending statuses
-        for i in 0..10_001u64 {
-            let status = make_order_status("BTC", i, "open");
-            state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-        }
-        assert!(state.pending_order_statuses_count() > 10_000);
-        assert!(state.cleanup_stale_pending(), "a force-clear must be reported as data loss");
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_order_status_at("BTC", 1, "open", "2024-01-15 10:30:00")]))
+            .unwrap();
+        // Only 1s of stream has passed - the diff is delayed, not gone.
+        state.time = ts_ms("2024-01-15 10:30:01");
+        assert!(!state.cleanup_stale_pending(), "no fault");
+        assert_eq!(state.pending_order_statuses_count(), 1, "young half must be kept");
+        // The delayed diff arrives -> the order rests correctly.
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("BTC", 1, OrderDiff::New { sz: "1.0".to_string() })]))
+            .unwrap();
         assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.order_count(), 1, "delayed order is not lost");
+    }
+
+    // A half unpaired for many seconds never had a partner (immediate fill /
+    // filtered counterpart). Evicting it is housekeeping, NOT data loss: it must
+    // be dropped WITHOUT triggering a re-sync.
+    #[test]
+    fn test_aged_orphan_status_evicted_without_resync() {
+        let mut state = empty_state();
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_order_status_at("BTC", 1, "open", "2024-01-15 10:30:00")]))
+            .unwrap();
+        assert_eq!(state.pending_order_statuses_count(), 1);
+        state.time = ts_ms("2024-01-15 10:30:20"); // 20s later
+        assert!(!state.cleanup_stale_pending(), "aged-orphan eviction is not a re-sync trigger");
+        assert_eq!(state.pending_order_statuses_count(), 0, "aged orphan evicted");
     }
 
     #[test]
-    fn test_cleanup_stale_pending_diffs() {
+    fn test_aged_orphan_diff_evicted_without_resync() {
         let mut state = empty_state();
-        // Insert 1_001 pending diffs
-        for i in 0..1_001u64 {
-            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string() });
-            state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
-        }
-        assert!(state.pending_new_diffs_count() > 1_000);
-        assert!(state.cleanup_stale_pending(), "a force-clear must be reported as data loss");
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("BTC", 9, OrderDiff::New { sz: "1.0".to_string() })]))
+            .unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 1);
+        state.time = ts_ms("2024-01-15 10:30:20");
+        assert!(!state.cleanup_stale_pending());
         assert_eq!(state.pending_new_diffs_count(), 0);
     }
 
+    // Evicting an aged orphan must not disturb genuinely resting orders.
     #[test]
-    fn test_cleanup_below_threshold_no_op() {
+    fn test_orphan_eviction_leaves_resting_orders_intact() {
         let mut state = empty_state();
-        for i in 0..100u64 {
-            let status = make_order_status("BTC", i, "open");
-            state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        // A real resting order (status + diff pair).
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_order_status_at("BTC", 1, "open", "2024-01-15 10:30:00")]))
+            .unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("BTC", 1, OrderDiff::New { sz: "1.0".to_string() })]))
+            .unwrap();
+        assert_eq!(state.order_count(), 1);
+        // An orphan status that never rests.
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_order_status_at("BTC", 2, "open", "2024-01-15 10:30:00")]))
+            .unwrap();
+        state.time = ts_ms("2024-01-15 10:30:20");
+        assert!(!state.cleanup_stale_pending());
+        assert_eq!(state.pending_order_statuses_count(), 0, "orphan gone");
+        assert_eq!(state.order_count(), 1, "resting order untouched");
+    }
+
+    // The hard cap is a genuine-fault backstop: a cache still huge AFTER
+    // age-eviction (a stalled/flooding partner stream) does warrant a re-sync.
+    #[test]
+    fn test_hard_cap_overflow_triggers_resync() {
+        use crate::order_book::types::Sz;
+        let mut state = empty_state();
+        state.time = ts_ms("2024-01-15 10:30:00");
+        // > HARD_CAP young entries (same block-time as now): age-eviction cannot
+        // drop them, so this is a real fault.
+        for i in 0..200_001u64 {
+            state.pending_new_diffs.insert(Oid::new(i), (state.time, Sz::new(1)));
         }
-        assert!(!state.cleanup_stale_pending(), "below-threshold cleanup is not data loss");
-        assert_eq!(state.pending_order_statuses_count(), 100); // not cleared
+        assert!(state.cleanup_stale_pending(), "over hard cap after age-eviction => re-sync");
     }
 
     // ==================== Per-coin L4 snapshot ====================

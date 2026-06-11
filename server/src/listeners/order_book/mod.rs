@@ -641,7 +641,7 @@ impl OrderBookListener {
                 // A force-clear may evict genuinely in-flight order halves, so it
                 // counts as data loss and the book must re-sync.
                 if state.cleanup_stale_pending() {
-                    desync_reason = Some("pending_cache_cleared");
+                    desync_reason = Some("pending_cache_overflow");
                 }
 
                 info!(
