@@ -292,14 +292,26 @@ impl FileReader {
         if let Some(latest) = self.find_latest_file() {
             if let Some(ref current) = self.current_path {
                 if latest != *current {
-                    // Check if the new file has data (modification time is newer)
-                    if let (Ok(latest_meta), Ok(current_meta)) = (latest.metadata(), current.metadata()) {
-                        if let (Ok(latest_mtime), Ok(current_mtime)) = (latest_meta.modified(), current_meta.modified())
-                        {
-                            if latest_mtime > current_mtime {
-                                return Some(latest);
+                    match (latest.metadata(), current.metadata()) {
+                        // Check if the new file has data (modification time is newer)
+                        (Ok(latest_meta), Ok(current_meta)) => {
+                            if let (Ok(latest_mtime), Ok(current_mtime)) =
+                                (latest_meta.modified(), current_meta.modified())
+                            {
+                                if latest_mtime > current_mtime {
+                                    return Some(latest);
+                                }
                             }
                         }
+                        // The tracked file no longer exists (deleted, or it was a
+                        // transient path that vanished — observed when a node
+                        // upgrade briefly created a stray entry in the streaming
+                        // dir): the mtime comparison can never succeed again, so
+                        // without this arm the reader is wedged on the ghost path
+                        // forever — every event logs an open error and no live
+                        // data flows. Fail over to the newest existing file.
+                        (Ok(_), Err(_)) => return Some(latest),
+                        _ => {}
                     }
                 }
             } else {
@@ -834,6 +846,43 @@ mod tests {
         assert!(reader.on_modify().is_empty());
         assert!(reader.take_desynced(), "discarding buffered data must flag a desync");
         assert!(!reader.take_desynced(), "the flag is drained by take_desynced");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_check_for_newer_file_fails_over_when_tracked_file_vanishes() {
+        let dir = test_dir("ghost");
+        let day = dir.join("hourly").join("20240101");
+        std::fs::create_dir_all(&day).unwrap();
+        let live = day.join("0");
+        append(&live, "{\"a\":1}\n");
+
+        // Track a transient path that then disappears (e.g. a stray entry a
+        // node upgrade briefly created in the streaming dir).
+        let ghost = dir.join("20240101");
+        append(&ghost, "");
+        let mut reader = FileReader::new(dir.clone());
+        reader.start_tracking(&ghost);
+        std::fs::remove_file(&ghost).unwrap();
+
+        // Without the vanished-file arm this returns None forever (mtime
+        // comparison needs both files to exist) and the reader never leaves
+        // the ghost path.
+        assert_eq!(reader.check_for_newer_file(), Some(live));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_check_for_newer_file_keeps_current_when_it_is_the_newest() {
+        let dir = test_dir("keep_current");
+        let day = dir.join("hourly").join("20240101");
+        std::fs::create_dir_all(&day).unwrap();
+        let live = day.join("0");
+        append(&live, "{\"a\":1}\n");
+
+        let mut reader = FileReader::new(dir.clone());
+        reader.start_tracking(&live);
+        assert_eq!(reader.check_for_newer_file(), None, "still the newest existing file");
         std::fs::remove_dir_all(&dir).ok();
     }
 
