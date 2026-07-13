@@ -85,6 +85,10 @@ struct FileReader {
     // Set when buffered data had to be discarded (oversized partial line);
     // drained by take_desynced so the watcher can notify the listener.
     desynced: bool,
+    // Open failures repeat at poll rate (~1 kHz) while the condition lasts, so
+    // log only the first failure per tracked path (2026-07-12: a wedged reader
+    // wrote ~300 error lines/sec until restarted).
+    open_error_logged: bool,
 }
 
 impl FileReader {
@@ -96,6 +100,7 @@ impl FileReader {
             partial_line: String::new(),
             base_dir,
             desynced: false,
+            open_error_logged: false,
         }
     }
 
@@ -238,6 +243,7 @@ impl FileReader {
         self.file = None;
         self.file_position = cut_pos;
         self.partial_line.clear();
+        self.open_error_logged = false;
         true
     }
 
@@ -333,9 +339,15 @@ impl FileReader {
             // still observes appended data (the node only ever appends).
             if self.file.is_none() {
                 match File::open(path) {
-                    Ok(file) => self.file = Some(file),
+                    Ok(file) => {
+                        self.file = Some(file);
+                        self.open_error_logged = false;
+                    }
                     Err(err) => {
-                        error!("Failed to open {}: {err}", path.display());
+                        if !self.open_error_logged {
+                            error!("Failed to open {}: {err}", path.display());
+                            self.open_error_logged = true;
+                        }
                         return lines;
                     }
                 }
@@ -464,6 +476,7 @@ impl FileReader {
         self.file = None;
         self.file_position = 0;
         self.partial_line.clear();
+        self.open_error_logged = false;
 
         old_lines
     }
@@ -479,6 +492,7 @@ impl FileReader {
         self.current_path = Some(path.clone());
         self.file = None;
         self.partial_line.clear();
+        self.open_error_logged = false;
     }
 }
 
@@ -563,7 +577,15 @@ pub(super) fn spawn_file_watcher(
                 Ok(Ok(event)) => {
                     if event.kind.is_create() || event.kind.is_modify() {
                         let path = &event.paths[0];
-                        if path.is_dir() {
+                        // Only an existing regular file may become the tracked
+                        // path. A bare !is_dir() check lets NONEXISTENT paths
+                        // through: notify can emit a create event attributed to
+                        // the wrong parent (observed on every hl-visor child
+                        // restart, 2026-07-04/09/11/12 — the day-directory
+                        // create arrives as <root>/YYYYMMDD instead of
+                        // <root>/hourly/YYYYMMDD), and tracking such a phantom
+                        // path wedges the reader on a file it can never open.
+                        if !path.is_file() {
                             continue;
                         }
 
