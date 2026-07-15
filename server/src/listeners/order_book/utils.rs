@@ -177,12 +177,15 @@ impl L2SnapshotParams {
 /// rejects `n_levels > MAX_LEVELS`, so deeper levels are pure waste in CPU,
 /// memory, and broadcast Arc size (BTC: ~500 -> 100 levels/side).
 ///
-/// Each requested variant is derived *directly from the raw base* `(None, None)`,
-/// never from a coarser sibling: aggregation is lossy across mantissas (e.g.
-/// `(5, Some(5))` is not derivable from `(5, Some(2))`), and the full-information
-/// base is a correct source for every shape. The base is always included so the
-/// raw `(None, None)` consumers (and the chain) stay correct; it is the parent of
-/// every derived shape and only one extra cheap entry.
+/// Each variant MUST aggregate the full book and only then truncate to the cap
+/// (the cap counts aggregated *buckets*, not raw levels). Deriving aggregated
+/// variants from the truncated raw base is NOT equivalent: the top-`MAX_LEVELS`
+/// raw levels cluster within a few dollars of the mid, so at coarse groupings
+/// (e.g. `nSigFigs=2`, $1000-wide buckets on BTC) they all collapse into ~1
+/// bucket — while HL's public API serves 20 buckets spanning tens of thousands
+/// of dollars for the same params. `OrderBook::to_l2_snapshot` walks the whole
+/// side, bucketing as it goes and stopping once the cap in buckets is reached,
+/// which matches the public API's aggregate-then-truncate semantics.
 fn compute_l2_variants_for_coin<O: InnerOrder>(
     order_book: &crate::order_book::OrderBook<O>,
     active: &HashSet<L2SnapshotParams>,
@@ -194,19 +197,16 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
     }
     let cap = Some(MAX_LEVELS);
 
-    // Raw base: capped, full-information, the parent of every derived shape.
     let base_params = L2SnapshotParams { n_sig_figs: None, mantissa: None };
-    let base = order_book.to_l2_snapshot(cap, None, None);
-
     for params in active {
         if *params == base_params {
             continue; // inserted unconditionally below
         }
-        let snapshot = base.to_l2_snapshot(cap, params.n_sig_figs, params.mantissa);
+        let snapshot = order_book.to_l2_snapshot(cap, params.n_sig_figs, params.mantissa);
         out.insert(*params, snapshot);
     }
-    // Always expose the raw base (one cheap entry) so raw consumers never miss it.
-    out.insert(base_params, base);
+    // Always expose the raw base so raw (None, None) consumers never miss it.
+    out.insert(base_params, order_book.to_l2_snapshot(cap, None, None));
     out
 }
 
@@ -548,9 +548,44 @@ mod tests {
     }
 
     #[test]
+    fn test_coarse_variant_aggregates_full_depth_not_truncated_base() {
+        // Regression: aggregated variants used to be derived from the raw base
+        // AFTER it was truncated to MAX_LEVELS raw levels. The top raw levels
+        // cluster near the mid, so coarse groupings (nSigFigs=2 -> $1000-wide
+        // buckets here) collapsed into 1-2 buckets and all deep far-from-mid
+        // liquidity vanished. Aggregation must run over the FULL book and
+        // truncate by aggregated buckets, like HL's public API.
+        use crate::types::subscription::MAX_LEVELS;
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        let mut oid = 0u64;
+        // More than MAX_LEVELS raw bid levels packed within ~$120 of the mid...
+        for i in 0..(MAX_LEVELS + 20) {
+            books.add_order(order(oid, "BTC", Side::Bid, "1", &format!("{}", 64_931 + i)));
+            oid += 1;
+        }
+        // ...plus deep liquidity far below the mid that the truncated base never saw.
+        for deep_px in [50_000, 40_000, 30_000, 20_000] {
+            books.add_order(order(oid, "BTC", Side::Bid, "1", &format!("{deep_px}")));
+            oid += 1;
+        }
+        books.add_order(order(oid, "BTC", Side::Ask, "1", "65100"));
+
+        let mut active = HashSet::new();
+        active.insert(L2SnapshotParams::new(Some(2), None));
+        let variants = compute_l2_variants_for_coin(books.as_ref().get(&Coin::new("BTC")).unwrap(), &active);
+        let [bids, _] = variants.get(&L2SnapshotParams::new(Some(2), None)).unwrap().as_ref();
+
+        // 64931..=65050 buckets to {65000, 64000}; the deep levels add 4 more.
+        assert_eq!(bids.len(), 6, "coarse buckets must cover the full book depth, got {bids:?}");
+        let total_sz: u64 = bids.iter().map(|l| l.sz.value()).sum();
+        let expected_sz = Sz::parse_from_str(&format!("{}", MAX_LEVELS + 24)).unwrap().value();
+        assert_eq!(total_sz, expected_sz, "no liquidity may be dropped by aggregation");
+    }
+
+    #[test]
     fn test_requested_variant_matches_full_compute() {
-        // A variant derived directly from the base must equal what the all-variants
-        // build produces for the same shape (derive-from-base is value-correct).
+        // A single-shape build must equal what the all-variants build produces
+        // for the same shape (subscription-aware computation is value-correct).
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
         for i in 0..20 {
             books.add_order(order(i, "BTC", Side::Bid, "1", &format!("{}", 50000 - i)));

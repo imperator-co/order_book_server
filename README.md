@@ -261,6 +261,8 @@ Streams raw order book diffs as they arrive. Each diff is one of: `new` (order a
 ```
 Optional parameters: `nSigFigs` (2-5), `nLevels` (max 100, default 20), `mantissa` (2 or 5)
 
+Aggregation matches HL's public API semantics: the **full** book is bucketed by `nSigFigs`/`mantissa` first, then truncated to `nLevels` aggregated buckets — so coarse groupings (e.g. `nSigFigs: 2`) return deep ladders spanning far from the mid, not just the near-mid raw levels.
+
 ### Subscribe to L4 Orderbook
 ```json
 { "method": "subscribe", "subscription": { "type": "l4Book", "coin": "BTC" } }

@@ -34,6 +34,13 @@ impl<O: InnerOrder> OrderBook<O> {
 }
 
 impl Snapshot<InnerLevel> {
+    /// Re-aggregate an existing L2 snapshot. Only valid on an UNTRUNCATED
+    /// input: re-aggregating a level-capped snapshot collapses coarse
+    /// groupings to the few buckets its near-mid levels span (the l2Book
+    /// coarse-grouping bug). The live path aggregates straight from the full
+    /// book (`OrderBook::to_l2_snapshot`); this stays test-only to prove the
+    /// two are equivalent on full-information input.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn to_l2_snapshot(
         &self,
@@ -52,6 +59,7 @@ impl Snapshot<InnerLevel> {
     }
 }
 
+#[cfg(test)]
 #[must_use]
 fn l2_levels_to_l2_levels(
     levels: &[InnerLevel],
