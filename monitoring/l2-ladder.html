@@ -330,14 +330,16 @@ class Ladder {
 
     ui.placeholder.style.display = "none";
 
-    const span = (ls) => {
-      if (!ls.length) return "0 levels";
-      const pxs = ls.map((l) => parseFloat(l.px));
+    // Stats follow the DISPLAYED slice; the total shows what the feed carries.
+    const span = (shown, all) => {
+      if (!shown.length) return "0 levels";
+      const pxs = shown.map((l) => parseFloat(l.px));
       const s = Math.max(...pxs) - Math.min(...pxs);
-      return `${ls.length} levels · span $${s.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+      const count = shown.length < all.length ? `${shown.length}/${all.length}` : `${shown.length}`;
+      return `${count} levels · span $${s.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
     };
-    ui.metaAsks.textContent = "asks: " + span(asksAll);
-    ui.metaBids.textContent = "bids: " + span(bidsAll);
+    ui.metaAsks.textContent = "asks: " + span(asks, asksAll);
+    ui.metaBids.textContent = "bids: " + span(bids, bidsAll);
 
     const val = (l) => parseFloat(l.sz) * (usd ? parseFloat(l.px) : 1);
     const cum = (ls) => { let c = 0; return ls.map((l) => { c += val(l); return c; }); };
