@@ -171,6 +171,7 @@ mod tests {
             m
         }
         fn modify_sz(&mut self, sz: Sz) { self.sz = sz.value(); }
+        fn modify_px(&mut self, px: Px) { self.limit_px = px.value(); }
         fn convert_trigger(&mut self, _: u64) {}
         fn coin(&self) -> crate::order_book::Coin { crate::order_book::Coin::new("") }
     }

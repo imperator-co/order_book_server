@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::L2Snapshots,
     order_book::{
-        Coin, InnerOrder, Oid, Snapshot,
+        Coin, InnerOrder, Oid, Px, Snapshot,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -25,9 +25,11 @@ pub(super) struct OrderBookState {
     // Entries carry their insertion time so cleanup can evict by age instead of
     // nuking the whole map (which killed in-flight halves and forced re-syncs).
     pending_order_statuses: HashMap<Oid, (NodeDataOrderStatus, Instant)>,
-    // Persistent cache of New diffs (sz values) waiting for their OrderStatuses
+    // Persistent cache of New diffs (sz + resting px) waiting for their OrderStatuses
     // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
-    pending_new_diffs: HashMap<Oid, (crate::order_book::types::Sz, Instant)>,
+    // px comes from the diff: the diff's px is the true resting price - trigger/converted
+    // orders can carry a different px on the status.
+    pending_new_diffs: HashMap<Oid, (crate::order_book::types::Sz, Px, Instant)>,
 }
 
 impl OrderBookState {
@@ -151,7 +153,7 @@ impl OrderBookState {
         }
 
         let before = self.pending_new_diffs.len();
-        self.pending_new_diffs.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
+        self.pending_new_diffs.retain(|_, (_, _, at)| at.elapsed() < PENDING_MAX_AGE);
         let aged_diffs = before - self.pending_new_diffs.len();
         if aged_diffs > 0 {
             // A New diff with no status in 60s: the order is missing from the book.
@@ -192,8 +194,8 @@ impl OrderBookState {
         HashMap<
             Coin,
             (
-                Option<(crate::order_book::Px, crate::order_book::Sz, u32)>,
-                Option<(crate::order_book::Px, crate::order_book::Sz, u32)>,
+                Option<(Px, crate::order_book::Sz, u32)>,
+                Option<(Px, crate::order_book::Sz, u32)>,
             ),
         >,
     ) {
@@ -219,12 +221,14 @@ impl OrderBookState {
             let oid = Oid::new(order_status.order.oid);
 
             // Check if there's a pending New diff for this order
-            if let Some((sz, _)) = self.pending_new_diffs.remove(&oid) {
+            if let Some((sz, px, _)) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
                 let order_coin = Coin::new(&order_status.order.coin);
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(sz);
+                // The resting px comes from the diff, not the status.
+                inner_order.modify_px(px);
                 inner_order.convert_trigger(time.max(0) as u64);
                 self.order_book.add_order(inner_order);
                 changed_coins.insert(order_coin.clone());
@@ -250,7 +254,7 @@ impl OrderBookState {
         for (_, at) in self.pending_order_statuses.values_mut() {
             *at = backdated;
         }
-        for (_, at) in self.pending_new_diffs.values_mut() {
+        for (_, _, at) in self.pending_new_diffs.values_mut() {
             *at = backdated;
         }
     }
@@ -283,6 +287,11 @@ impl OrderBookState {
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
+                    // The diff's px is the true resting price (trigger/converted orders can
+                    // carry a different px on the status). Parse failure = schema drift ->
+                    // fail fast; silently keeping the status px would leave wrong resting
+                    // prices on the book and make later diffs unmatchable.
+                    let diff_px = Px::parse_from_str(diff.px())?;
                     // Check if OrderStatus already arrived
                     if let Some((order, _)) = self.pending_order_statuses.remove(&oid) {
                         // Both arrived - add order immediately!
@@ -290,14 +299,15 @@ impl OrderBookState {
                         let order_coin = Coin::new(&order.order.coin);
                         let mut inner_order: InnerL4Order = order.try_into()?;
                         inner_order.modify_sz(sz);
+                        inner_order.modify_px(diff_px);
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
                         self.order_book.add_order(inner_order);
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
-                        // Status hasn't arrived yet - cache the diff size
-                        self.pending_new_diffs.insert(oid.clone(), (sz, Instant::now()));
+                        // Status hasn't arrived yet - cache the diff size + resting px
+                        self.pending_new_diffs.insert(oid.clone(), (sz, diff_px, Instant::now()));
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
@@ -387,6 +397,56 @@ mod tests {
             "block_number": 100,
             "events": diffs
         })).unwrap()
+    }
+
+    /// Diff fixture with a custom px (for resting-px semantics tests).
+    fn make_order_diff_px(coin: &str, oid: u64, px: &str, diff: OrderDiff) -> NodeDataOrderDiff {
+        serde_json::from_value(serde_json::json!({
+            "user": "0x0000000000000000000000000000000000000000",
+            "oid": oid,
+            "px": px,
+            "coin": coin,
+            "raw_book_diff": diff
+        })).unwrap()
+    }
+
+    // ==================== Resting-px semantics ====================
+
+    /// The resting price must come from the diff, not the status (trigger/converted
+    /// orders can carry a different px on the status). Covers both arrival orders:
+    /// diff first (px stored in pending) and status first (px applied on pairing).
+    #[test]
+    fn test_resting_px_comes_from_diff_not_status() {
+        // status px is fixed at 100.0 (make_l4_order); diff px is 101.5 -> book must show 101.5
+        for diff_first in [true, false] {
+            let mut state = empty_state();
+            let diff = make_order_diff_px("ETH", 42, "101.5", OrderDiff::New { sz: "1.0".to_string() });
+            let status = make_order_status("ETH", 42, "open");
+            if diff_first {
+                state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+                state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+            } else {
+                state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+                state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+            }
+            assert_eq!(state.order_count(), 1);
+            let (_, _, snap) = state.compute_snapshot_for_coin(&Coin::new("ETH")).unwrap();
+            let order = &snap.as_ref()[0][0];
+            assert_eq!(
+                order.limit_px,
+                Px::parse_from_str("101.5").unwrap(),
+                "resting px must come from the diff (diff_first={diff_first})"
+            );
+        }
+    }
+
+    /// Fail fast on unparseable diff px (= schema drift) instead of silently
+    /// falling back to the status px, which would leave wrong resting prices.
+    #[test]
+    fn test_bad_diff_px_fails_fast() {
+        let mut state = empty_state();
+        let diff = make_order_diff_px("ETH", 43, "not-a-price", OrderDiff::New { sz: "1.0".to_string() });
+        assert!(state.apply_order_diffs_hft(make_diff_batch(vec![diff])).is_err());
     }
 
     // ==================== Initialization Tests ====================

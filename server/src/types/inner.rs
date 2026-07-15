@@ -51,6 +51,10 @@ impl InnerOrder for InnerL4Order {
         self.sz.decrement_sz(dec.value());
     }
 
+    fn modify_px(&mut self, px: Px) {
+        self.limit_px = px;
+    }
+
     fn modify_sz(&mut self, sz: Sz) {
         self.sz = sz;
     }

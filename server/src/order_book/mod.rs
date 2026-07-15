@@ -270,6 +270,10 @@ mod tests {
             self.sz = sz.value();
         }
 
+        fn modify_px(&mut self, px: Px) {
+            self.limit_px = px.value();
+        }
+
         fn convert_trigger(&mut self, _: u64) {}
 
         fn coin(&self) -> Coin {
