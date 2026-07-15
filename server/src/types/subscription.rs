@@ -232,7 +232,7 @@ mod test {
         let arced: std::sync::Arc<Vec<crate::types::Trade>> = serde_json::from_str(trades_json).unwrap();
         assert_eq!(serde_json::to_string(&plain).unwrap(), serde_json::to_string(&arced).unwrap());
 
-        let diffs_json = r#"[{"user":"0x0000000000000000000000000000000000000001","oid":123,"px":"50000.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.5"}}}]"#;
+        let diffs_json = r#"[{"user":"0x0000000000000000000000000000000000000001","oid":123,"side":"B","px":"50000.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.5"}}}]"#;
         let plain: Vec<NodeDataOrderDiff> = serde_json::from_str(diffs_json).unwrap();
         let arced: std::sync::Arc<Vec<NodeDataOrderDiff>> = serde_json::from_str(diffs_json).unwrap();
         assert_eq!(serde_json::to_string(&plain).unwrap(), serde_json::to_string(&arced).unwrap());

@@ -1439,6 +1439,7 @@ mod tests {
             "events": [{
                 "user": "0x0000000000000000000000000000000000000000",
                 "oid": oid,
+                "side": "B",
                 "px": "100.0",
                 "coin": coin,
                 "raw_book_diff": raw_book_diff,
@@ -1677,6 +1678,7 @@ mod tests {
                 serde_json::json!({
                     "user": "0x0000000000000000000000000000000000000000",
                     "oid": i,
+                    "side": "B",
                     "px": "100.0",
                     "coin": coin,
                     "raw_book_diff": {"new": {"sz": "1.0"}},

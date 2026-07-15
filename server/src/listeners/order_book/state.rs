@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::L2Snapshots,
     order_book::{
-        Coin, InnerOrder, Oid, Snapshot,
+        Coin, InnerOrder, Oid, Px, Snapshot,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -192,8 +192,8 @@ impl OrderBookState {
         HashMap<
             Coin,
             (
-                Option<(crate::order_book::Px, crate::order_book::Sz, u32)>,
-                Option<(crate::order_book::Px, crate::order_book::Sz, u32)>,
+                Option<(Px, crate::order_book::Sz, u32)>,
+                Option<(Px, crate::order_book::Sz, u32)>,
             ),
         >,
     ) {
@@ -295,6 +295,31 @@ impl OrderBookState {
                         self.order_book.add_order(inner_order);
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
+                    } else if diff.special_address() {
+                        // HIP-2 / assistance-fund orders never get an order status event.
+                        // Without this branch the diff sits in pending_new_diffs for 60s,
+                        // is evicted as data loss (forcing a re-sync), and the spot book
+                        // permanently misses the system market maker's liquidity.
+                        // Insert directly as a synthetic Alo limit order.
+                        let inner_order = InnerL4Order {
+                            user: diff.user(),
+                            coin: coin.clone(),
+                            side: diff.side(),
+                            limit_px: Px::parse_from_str(diff.px())?,
+                            sz,
+                            oid: oid.value(),
+                            timestamp: time,
+                            trigger_condition: "N/A".to_string(),
+                            is_trigger: false,
+                            trigger_px: "0.0".to_string(),
+                            is_position_tpsl: false,
+                            reduce_only: false,
+                            order_type: "Limit".to_string(),
+                            tif: Some("Alo".to_string()),
+                            cloid: None,
+                        };
+                        self.order_book.add_order(inner_order);
+                        changed_coins.insert(coin);
                     } else {
                         // Status hasn't arrived yet - cache the diff size
                         self.pending_new_diffs.insert(oid.clone(), (sz, Instant::now()));
@@ -365,6 +390,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "user": "0x0000000000000000000000000000000000000000",
             "oid": oid,
+            "side": "B",
             "px": "100.0",
             "coin": coin,
             "raw_book_diff": diff
@@ -387,6 +413,32 @@ mod tests {
             "block_number": 100,
             "events": diffs
         })).unwrap()
+    }
+
+    // ==================== System-address synthetic orders ====================
+
+    /// A New diff from HIP-2 (0xFF..FF) never gets an order status -> it must be
+    /// inserted directly as a synthetic Alo order instead of sitting in
+    /// pending_new_diffs until aged out as data loss (which forces a re-sync).
+    #[test]
+    fn test_special_address_new_diff_inserts_synthetic_order() {
+        let mut state = empty_state();
+        let diff: NodeDataOrderDiff = serde_json::from_value(serde_json::json!({
+            "user": format!("0x{}", "ff".repeat(20)),
+            "oid": 7,
+            "side": "B",
+            "px": "325.5",
+            "coin": "@260",
+            "raw_book_diff": OrderDiff::New { sz: "3.0".to_string() }
+        })).unwrap();
+        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        assert!(changed.contains(&Coin::new("@260")), "synthetic insert must mark the coin changed");
+        assert_eq!(state.order_count(), 1, "HIP-2 order must be inserted directly");
+        assert_eq!(state.pending_new_diffs_count(), 0, "must not wait for a status that never comes");
+        let (_, _, snap) = state.compute_snapshot_for_coin(&Coin::new("@260")).unwrap();
+        let order = &snap.as_ref()[0][0];
+        assert_eq!(order.limit_px, Px::parse_from_str("325.5").unwrap());
+        assert_eq!(order.tif.as_deref(), Some("Alo"));
     }
 
     // ==================== Initialization Tests ====================
