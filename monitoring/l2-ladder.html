@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L2 Ladder — relay vs HL public</title>
+<style>
+  :root {
+    --bg: #0d0e10;
+    --panel: #131417;
+    --row: #17181c;
+    --row-alt: #141519;
+    --text: #e8e8ea;
+    --muted: #8a8d93;
+    --red: #ef5b66;
+    --red-bar: rgba(239, 91, 102, 0.16);
+    --green: #2ebd85;
+    --green-bar: rgba(46, 189, 133, 0.16);
+    --border: #26282e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 16px;
+  }
+  h1 { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: var(--muted); }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 14px; font-size: 13px;
+  }
+  .controls label { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .controls input[type="text"] {
+    background: var(--row); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; width: 70px; font-size: 13px;
+  }
+  .controls input#wsUrl { width: 210px; }
+  .controls select {
+    background: var(--row); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 6px; font-size: 13px;
+  }
+  .controls button {
+    background: #22242a; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 14px; font-size: 13px; cursor: pointer;
+  }
+  .controls button:hover { background: #2a2d34; }
+  .panels { display: flex; gap: 14px; flex-wrap: wrap; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    width: 400px; max-width: 100%; overflow: hidden;
+  }
+  .panel .head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 10px 14px 6px;
+  }
+  .panel .head .name { font-weight: 600; font-size: 14px; }
+  .panel .head .status { font-size: 11px; color: var(--muted); }
+  .panel .head .status.ok { color: var(--green); }
+  .panel .head .status.err { color: var(--red); }
+  .meta {
+    padding: 0 14px 8px; font-size: 11px; color: var(--muted);
+    display: flex; gap: 14px;
+  }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; table-layout: fixed; }
+  thead th {
+    font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.04em; padding: 6px 14px; text-align: right;
+  }
+  thead th:first-child { text-align: left; }
+  tbody td {
+    padding: 7px 14px; text-align: right; font-size: 14px; position: relative; z-index: 1;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
+  tbody td:first-child { text-align: left; font-weight: 500; }
+  tbody tr { background: var(--row); }
+  tbody tr:nth-child(odd) { background: var(--row-alt); }
+  tbody tr .bar {
+    position: absolute; top: 0; bottom: 0; left: 0; z-index: 0; pointer-events: none;
+    width: 0;
+  }
+  tr.ask td:first-child { color: var(--red); }
+  tr.bid td:first-child { color: var(--green); }
+  tr.spread { background: #202229 !important; }
+  tr.spread td { font-weight: 600; padding: 8px 14px; }
+  tr.spread td:first-child { color: var(--text); }
+  .bs {
+    display: flex; align-items: center; gap: 0; height: 34px; margin: 8px 10px 12px;
+    border-radius: 6px; overflow: hidden; font-size: 13px; font-weight: 600;
+  }
+  .bs .b {
+    background: rgba(46,189,133,0.22); color: var(--green); display: flex; align-items: center;
+    padding-left: 10px; height: 100%; min-width: 40px;
+  }
+  .bs .s { background: rgba(239,91,102,0.22); color: var(--red); display: flex; align-items: center; justify-content: flex-end; padding-right: 10px; height: 100%; flex: 1; min-width: 40px; }
+  .bs .tagB, .bs .tagS {
+    display: inline-flex; width: 18px; height: 18px; border-radius: 4px; margin-right: 6px;
+    align-items: center; justify-content: center; font-size: 11px; color: var(--text);
+    background: #101114;
+  }
+  .bs .tagS { margin: 0 0 0 6px; }
+  .empty { padding: 30px 14px; text-align: center; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>L2 order book ladder — node relay vs HL public API</h1>
+
+<div class="controls">
+  <label>Relay <input type="text" id="wsUrl" value="ws://3.114.28.71:8000/ws"></label>
+  <label>Coin <input type="text" id="coin" value="BTC"></label>
+  <label>Grouping
+    <select id="grouping">
+      <option value="">raw</option>
+      <option value="5">nSigFigs 5</option>
+      <option value="5,2">nSigFigs 5 · mantissa 2</option>
+      <option value="5,5">nSigFigs 5 · mantissa 5</option>
+      <option value="4">nSigFigs 4</option>
+      <option value="3" selected>nSigFigs 3</option>
+      <option value="2">nSigFigs 2</option>
+    </select>
+  </label>
+  <label>Rows/side
+    <select id="rows">
+      <option>5</option><option selected>10</option><option>15</option>
+      <option>20</option><option>50</option><option>100</option>
+    </select>
+  </label>
+  <label>Unit
+    <select id="unit"><option value="base">base size</option><option value="usd" selected>USD</option></select>
+  </label>
+  <label>Refresh
+    <select id="refresh">
+      <option value="0" selected>max (every update)</option>
+      <option value="100">10/s</option>
+      <option value="250">4/s</option>
+      <option value="500">2/s</option>
+      <option value="1000">1/s</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="compare" checked> compare with HL public API</label>
+  <button id="apply">Apply</button>
+</div>
+
+<div class="panels">
+  <div class="panel" id="panel-relay"></div>
+  <div class="panel" id="panel-hl" style="display:none"></div>
+</div>
+
+<script>
+"use strict";
+
+const HL_PUBLIC_WS = "wss://api.hyperliquid.xyz/ws";
+
+// Relabel the grouping options with the absolute tick each shape produces at
+// the current mid (nSigFigs is magnitude-relative: 2 sig figs = $1000 buckets
+// on BTC@65k but $1 buckets on HYPE@40). Ticks only depend on the mid's decade,
+// so skip unless that changed — and NEVER rewrite options while the menu is
+// open (focused): mutating <option> text mid-click breaks the native dropdown.
+let lastGroupingExp = null;
+function updateGroupingLabels(mid) {
+  if (!(mid > 0)) return;
+  const select = document.getElementById("grouping");
+  if (document.activeElement === select) return; // menu may be open; retry on a later paint
+  const exp = Math.floor(Math.log10(mid));
+  if (exp === lastGroupingExp) return;
+  lastGroupingExp = exp;
+  const tick = (sf, m) => (m || 1) * Math.pow(10, exp + 1 - sf);
+  const fmtTick = (t) => "$" + (t >= 1
+    ? t.toLocaleString("en-US", { maximumFractionDigits: 0 })
+    : t.toFixed(Math.min(10, -Math.floor(Math.log10(t)))));
+  for (const opt of select.options) {
+    if (!opt.value) { opt.textContent = "raw (no grouping)"; continue; }
+    const [sf, m] = opt.value.split(",").map(Number);
+    const base = m ? `nSigFigs ${sf} · mantissa ${m}` : `nSigFigs ${sf}`;
+    opt.textContent = `${base} — ${fmtTick(tick(sf, m))}`;
+  }
+}
+
+const fmtPx = (px) => {
+  const v = parseFloat(px);
+  return "$" + v.toLocaleString("en-US", { maximumFractionDigits: v >= 1000 ? 0 : 6 });
+};
+const fmtNum = (v) => {
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + "B";
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
+  if (v >= 1e3) return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  return v.toLocaleString("en-US", { maximumFractionDigits: 4 });
+};
+
+class Ladder {
+  constructor(rootId, name, isRelay) {
+    this.root = document.getElementById(rootId);
+    this.name = name;
+    this.isRelay = isRelay;
+    this.ws = null;
+    this.pending = null;
+    this.timer = 0;
+    this.raf = 0;
+    // Generation counter: bumped on every connect/stop. Handlers of an older
+    // socket compare their captured generation and become no-ops, so a socket
+    // closed by a re-connect can never resurrect itself via its onclose
+    // (that zombie kept the OLD subscription alive alongside the new one,
+    // making the panel flicker between two different variant streams).
+    this.gen = 0;
+  }
+
+  connect(url, cfg) {
+    this.stop();
+    this.cfg = cfg;
+    this.buildSkeleton();
+    this.open(url);
+    // refreshMs = 0: paint every update, coalesced to animation frames (fast
+    // path — in-place patching keeps this cheap). refreshMs > 0: fixed-cadence
+    // repaint of the latest snapshot for a calmer display.
+    if (cfg.refreshMs > 0) this.timer = setInterval(() => this.render(), cfg.refreshMs);
+  }
+
+  buildSkeleton() {
+    const n = this.cfg.rows;
+    const mkRow = (cls) => `
+      <tr class="${cls}" style="display:none">
+        <td><span class="bar"></span><span class="v"></span></td>
+        <td><span class="v"></span></td>
+        <td><span class="v"></span></td>
+      </tr>`;
+    let rows = "";
+    for (let i = 0; i < n; i++) rows += mkRow("ask");
+    rows += `<tr class="spread" style="display:none"><td>Écart</td><td><span class="v"></span></td><td><span class="v"></span></td></tr>`;
+    for (let i = 0; i < n; i++) rows += mkRow("bid");
+
+    this.root.innerHTML = `
+      <div class="head"><span class="name">${this.name}</span><span class="status">connecting…</span></div>
+      <div class="meta"><span class="m-asks"></span><span class="m-bids"></span></div>
+      <table>
+        <thead><tr><th style="width:34%">Prix</th><th>Taille</th><th>Montant total</th></tr></thead>
+        <tbody>
+          <tr class="placeholder"><td colspan="3" class="empty">waiting for data…</td></tr>
+          ${rows}
+        </tbody>
+      </table>
+      <div class="bs" style="display:none">
+        <div class="b"><span class="tagB">B</span><span class="pctB"></span></div>
+        <div class="s"><span class="pctS"></span><span class="tagS">S</span></div>
+      </div>`;
+
+    const $ = (sel) => this.root.querySelector(sel);
+    const rowRefs = (tr) => ({
+      tr,
+      bar: tr.querySelector(".bar"),
+      cells: [...tr.querySelectorAll(".v")],
+    });
+    this.ui = {
+      status: $(".status"),
+      metaAsks: $(".m-asks"),
+      metaBids: $(".m-bids"),
+      placeholder: $(".placeholder"),
+      askRows: [...this.root.querySelectorAll("tr.ask")].map(rowRefs),
+      spreadRow: rowRefs($("tr.spread")),
+      bidRows: [...this.root.querySelectorAll("tr.bid")].map(rowRefs),
+      bs: $(".bs"),
+      bsB: $(".bs .b"),
+      pctB: $(".pctB"),
+      pctS: $(".pctS"),
+    };
+  }
+
+  open(url) {
+    const gen = ++this.gen;
+    let ws;
+    try { ws = new WebSocket(url); }
+    catch (e) { this.setStatus("bad URL: " + e.message, "err"); return; }
+    this.ws = ws;
+    ws.onopen = () => {
+      if (gen !== this.gen) { try { ws.close(); } catch {} return; }
+      this.setStatus("live", "ok");
+      const sub = { type: "l2Book", coin: this.cfg.coin };
+      if (this.cfg.nSigFigs !== null) sub.nSigFigs = this.cfg.nSigFigs;
+      if (this.cfg.mantissa !== null) sub.mantissa = this.cfg.mantissa;
+      // Relay accepts nLevels; HL public WS l2Book does not — always ask the
+      // relay for the max so span stats reflect everything it can serve.
+      if (this.isRelay) sub.nLevels = 100;
+      ws.send(JSON.stringify({ method: "subscribe", subscription: sub }));
+    };
+    ws.onmessage = (ev) => {
+      if (gen !== this.gen) return; // stale socket, ignore
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.channel !== "l2Book" || !msg.data || msg.data.coin !== this.cfg.coin) return;
+      // The relay echoes the subscription shape in the payload (HL public does
+      // not) — drop anything that isn't OUR variant, so payloads from another
+      // subscription can never bleed into this panel.
+      if (this.isRelay
+          && ((msg.data.nSigFigs ?? null) !== this.cfg.nSigFigs
+              || (msg.data.mantissa ?? null) !== this.cfg.mantissa)) return;
+      this.pending = msg.data; // conflate: only the latest snapshot is painted
+      if (this.cfg.refreshMs === 0 && !this.raf) {
+        this.raf = requestAnimationFrame(() => { this.raf = 0; this.render(); });
+      }
+    };
+    ws.onclose = () => {
+      if (gen !== this.gen) return; // superseded or stopped: do NOT reconnect
+      this.setStatus("disconnected — retrying…", "err");
+      setTimeout(() => { if (gen === this.gen) this.open(url); }, 2000);
+    };
+    ws.onerror = () => {};
+  }
+
+  setStatus(text, cls) {
+    if (this.ui) { this.ui.status.textContent = text; this.ui.status.className = "status " + (cls || ""); }
+  }
+
+  stop() {
+    this.gen++; // invalidate every live handler (message, close, retry timers)
+    this.pending = null;
+    if (this.timer) { clearInterval(this.timer); this.timer = 0; }
+    if (this.raf) { cancelAnimationFrame(this.raf); this.raf = 0; }
+    if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
+  }
+
+  render() {
+    const data = this.pending;
+    if (!data) return;
+    this.pending = null; // repaint only when a new snapshot arrived
+    const [bidsAll, asksAll] = data.levels;
+    const n = this.cfg.rows;
+    const usd = this.cfg.unit === "usd";
+    const bids = bidsAll.slice(0, n);
+    const asks = asksAll.slice(0, n);
+    const ui = this.ui;
+
+    ui.placeholder.style.display = "none";
+
+    const span = (ls) => {
+      if (!ls.length) return "0 levels";
+      const pxs = ls.map((l) => parseFloat(l.px));
+      const s = Math.max(...pxs) - Math.min(...pxs);
+      return `${ls.length} levels · span $${s.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+    };
+    ui.metaAsks.textContent = "asks: " + span(asksAll);
+    ui.metaBids.textContent = "bids: " + span(bidsAll);
+
+    const val = (l) => parseFloat(l.sz) * (usd ? parseFloat(l.px) : 1);
+    const cum = (ls) => { let c = 0; return ls.map((l) => { c += val(l); return c; }); };
+    const bidCum = cum(bids);
+    const askCum = cum(asks);
+    const maxCum = Math.max(bidCum[bidCum.length - 1] || 0, askCum[askCum.length - 1] || 0, 1e-12);
+
+    // Patch a pooled row in place; no node creation, no innerHTML.
+    const patch = (ref, l, c, barColor) => {
+      ref.tr.style.display = "";
+      ref.bar.style.width = Math.min(100, (c / maxCum) * 100) + "%";
+      ref.bar.style.background = barColor;
+      ref.cells[0].textContent = fmtPx(l.px);
+      ref.cells[1].textContent = fmtNum(val(l));
+      ref.cells[2].textContent = fmtNum(c);
+    };
+    const hide = (ref) => { ref.tr.style.display = "none"; };
+
+    // Asks stack best-at-bottom (adjacent to the spread row): ask i fills the
+    // pool from the bottom up, unused rows at the top get hidden.
+    const nAskRows = ui.askRows.length;
+    for (let i = 0; i < nAskRows; i++) {
+      const ref = ui.askRows[nAskRows - 1 - i];
+      if (i < asks.length) patch(ref, asks[i], askCum[i], "var(--red-bar)");
+      else hide(ref);
+    }
+    for (let i = 0; i < ui.bidRows.length; i++) {
+      if (i < bids.length) patch(ui.bidRows[i], bids[i], bidCum[i], "var(--green-bar)");
+      else hide(ui.bidRows[i]);
+    }
+
+    if (bids.length && asks.length) {
+      const bb = parseFloat(bids[0].px), ba = parseFloat(asks[0].px);
+      const sp = ba - bb, pct = (sp / ((ba + bb) / 2)) * 100;
+      if (this.isRelay) updateGroupingLabels((ba + bb) / 2);
+      ui.spreadRow.tr.style.display = "";
+      ui.spreadRow.cells[0].textContent = "$" + sp.toLocaleString("en-US", { maximumFractionDigits: 6 });
+      ui.spreadRow.cells[1].textContent = pct.toFixed(3) + "%";
+    } else {
+      ui.spreadRow.tr.style.display = "none";
+    }
+
+    const bTot = bidCum[bidCum.length - 1] || 0;
+    const aTot = askCum[askCum.length - 1] || 0;
+    if (bTot + aTot > 0) {
+      const bPct = Math.round((bTot / (bTot + aTot)) * 100);
+      ui.bs.style.display = "flex";
+      ui.bsB.style.width = Math.max(8, Math.min(92, bPct)) + "%";
+      ui.pctB.textContent = bPct + "%";
+      ui.pctS.textContent = (100 - bPct) + "%";
+    }
+  }
+}
+
+const relay = new Ladder("panel-relay", "Node relay", true);
+const hl = new Ladder("panel-hl", "HL public API", false);
+
+function apply() {
+  const g = document.getElementById("grouping").value;
+  const [sf, m] = g ? g.split(",") : [null, null];
+  const cfg = {
+    coin: document.getElementById("coin").value.trim(),
+    nSigFigs: sf ? parseInt(sf, 10) : null,
+    mantissa: m ? parseInt(m, 10) : null,
+    rows: parseInt(document.getElementById("rows").value, 10),
+    unit: document.getElementById("unit").value,
+    refreshMs: parseInt(document.getElementById("refresh").value, 10),
+  };
+  relay.connect(document.getElementById("wsUrl").value.trim(), cfg);
+  const cmp = document.getElementById("compare").checked;
+  document.getElementById("panel-hl").style.display = cmp ? "" : "none";
+  if (cmp) hl.connect(HL_PUBLIC_WS, cfg); else hl.stop();
+}
+
+document.getElementById("apply").onclick = apply;
+document.querySelectorAll(".controls select, .controls input[type=checkbox]").forEach((el) => (el.onchange = apply));
+document.querySelectorAll(".controls input[type=text]").forEach((el) => (el.onkeydown = (e) => { if (e.key === "Enter") apply(); }));
+apply();
+</script>
+</body>
+</html>
