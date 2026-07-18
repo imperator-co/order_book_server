@@ -275,6 +275,14 @@ impl OrderBookListener {
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {}", height);
+        // Free the outgoing book BEFORE building its replacement. This fn is
+        // synchronous and runs under a single listener-lock hold (no await
+        // between the drop and the swap below), so the None window is
+        // unobservable - while holding both books alive would double peak RSS
+        // at the worst moment (snapshot install under load). The incremental
+        // L2 cache references the old book's coins/levels, so it drops here too.
+        self.order_book_state = None;
+        self.l2_snapshot_cache = HashMap::new();
         let mut new_state = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
 
         // Replay every cached batch above the snapshot height. Batches at or
@@ -330,12 +338,9 @@ impl OrderBookListener {
             };
         }
 
-        // The incremental L2 cache references the previous book's coins/levels;
-        // drop it so the next broadcast does a full rebuild against the new state.
-        self.l2_snapshot_cache = HashMap::new();
         // The conflation buffer references the previous universe; clear it too. The
-        // cache reset above makes every present coin uncached, so the next broadcast
-        // recomputes all of them fresh regardless.
+        // cache reset at the top makes every present coin uncached, so the next
+        // broadcast recomputes all of them fresh regardless.
         self.pending_dirty_l2_coins.clear();
         // Force the next flush to treat the active variant set as "changed" so the
         // empty cache is rebuilt against whatever shapes are currently subscribed.
@@ -1344,6 +1349,51 @@ mod tests {
         let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
         listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
         (listener, rx)
+    }
+
+    /// One-coin, one-bid Snapshots for init_from_snapshot tests.
+    fn snapshot_with(coin: &str, oid: u64, px_raw: u64) -> Snapshots<InnerL4Order> {
+        let order = InnerL4Order {
+            user: Address::new([0; 20]),
+            coin: Coin::new(coin),
+            side: Side::Bid,
+            limit_px: Px::new(px_raw),
+            sz: crate::order_book::Sz::new(100_000_000),
+            oid,
+            timestamp: 0,
+            trigger_condition: String::new(),
+            is_trigger: false,
+            trigger_px: String::new(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: String::new(),
+            tif: None,
+            cloid: None,
+        };
+        let mut book: crate::order_book::OrderBook<InnerL4Order> = crate::order_book::OrderBook::new();
+        book.add_order(order);
+        Snapshots::new(std::iter::once((Coin::new(coin), book.to_snapshot())).collect())
+    }
+
+    #[test]
+    fn test_init_from_snapshot_reinstall_replaces_book() {
+        // Guards the early old-book drop: a second install over an existing
+        // state must fully replace the book, serving exactly the new snapshot.
+        let (mut listener, _rx) = ready_listener();
+        listener.init_from_snapshot(snapshot_with("BTC", 1, 500), 10);
+        assert!(listener.compute_snapshot_for_coin(&Coin::new("BTC"), PxBand::default()).is_some());
+
+        listener.init_from_snapshot(snapshot_with("ETH", 2, 600), 20);
+        assert!(
+            listener.compute_snapshot_for_coin(&Coin::new("BTC"), PxBand::default()).is_none(),
+            "old book must be gone after reinstall"
+        );
+        let (_time, height, snap) =
+            listener.compute_snapshot_for_coin(&Coin::new("ETH"), PxBand::default()).expect("new book serves");
+        assert_eq!(height, 20);
+        let [bids, asks] = snap.as_ref();
+        assert_eq!(bids.len(), 1);
+        assert!(asks.is_empty());
     }
 
     #[test]
