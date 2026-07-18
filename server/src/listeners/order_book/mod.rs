@@ -7,7 +7,7 @@ use crate::{
         PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
-        Coin, Px, Side, Snapshot, Sz,
+        Coin, Px, PxBand, Side, Snapshot, Sz,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
     },
     prelude::*,
@@ -347,8 +347,12 @@ impl OrderBookListener {
     /// old all-coins compute_snapshot, which cloned the entire multi-book under
     /// the listener lock on every l4Book subscribe and stalled event processing
     /// for hundreds of milliseconds.
-    pub(crate) fn compute_snapshot_for_coin(&self, coin: &Coin) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
-        self.order_book_state.as_ref().and_then(|state| state.compute_snapshot_for_coin(coin))
+    pub(crate) fn compute_snapshot_for_coin(
+        &self,
+        coin: &Coin,
+        band: PxBand,
+    ) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
+        self.order_book_state.as_ref().and_then(|state| state.compute_snapshot_for_coin(coin, band))
     }
 }
 

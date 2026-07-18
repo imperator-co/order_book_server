@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::L2Snapshots,
     order_book::{
-        Coin, InnerOrder, Oid, Snapshot,
+        Coin, InnerOrder, Oid, PxBand, Snapshot,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -63,8 +63,12 @@ impl OrderBookState {
     /// L4 snapshot of a single coin - (time, height, snapshot). Returns None when
     /// the coin has no book. Cheap enough to run under the listener lock, unlike
     /// the old all-coins snapshot.
-    pub(super) fn compute_snapshot_for_coin(&self, coin: &Coin) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
-        self.order_book.snapshot_for_coin(coin).map(|snapshot| (self.time, self.height, snapshot))
+    pub(super) fn compute_snapshot_for_coin(
+        &self,
+        coin: &Coin,
+        band: PxBand,
+    ) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
+        self.order_book.snapshot_for_coin(coin, band).map(|snapshot| (self.time, self.height, snapshot))
     }
 
     /// Incremental variant: rebuilds variants only for `changed_coins` and reuses
@@ -628,13 +632,44 @@ mod tests {
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
 
-        let (_time, height, snapshot) = state.compute_snapshot_for_coin(&Coin::new("BTC")).unwrap();
+        let (_time, height, snapshot) = state.compute_snapshot_for_coin(&Coin::new("BTC"), PxBand::default()).unwrap();
         assert_eq!(height, 100); // batch helpers stamp block_number 100
         let [bids, asks] = snapshot.as_ref();
         assert_eq!(bids.len(), 1, "only BTC's single bid is included");
         assert!(asks.is_empty());
 
-        assert!(state.compute_snapshot_for_coin(&Coin::new("DOGE")).is_none(), "unknown coin yields None");
+        assert!(
+            state.compute_snapshot_for_coin(&Coin::new("DOGE"), PxBand::default()).is_none(),
+            "unknown coin yields None"
+        );
+    }
+
+    #[test]
+    fn test_compute_snapshot_for_coin_band_filters_and_keeps_time_height() {
+        let mut state = empty_state();
+        for (oid, px) in [(1u64, "50000.0"), (2, "60000.0"), (3, "70000.0")] {
+            let mut status = make_order_status("BTC", oid, "open");
+            status.order.limit_px = px.to_string();
+            state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+            let diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string() });
+            state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        }
+        let (full_time, full_height, _) =
+            state.compute_snapshot_for_coin(&Coin::new("BTC"), PxBand::default()).unwrap();
+
+        let band = PxBand::parse(Some("55000"), Some("65000")).unwrap();
+        let (time, height, snapshot) = state.compute_snapshot_for_coin(&Coin::new("BTC"), band).unwrap();
+        assert_eq!((time, height), (full_time, full_height), "band must not change time/height stamping");
+        let [bids, asks] = snapshot.as_ref();
+        assert_eq!(bids.iter().map(|o| o.oid).collect::<Vec<_>>(), vec![2], "only the in-band bid survives");
+        assert!(asks.is_empty());
+
+        // A band matching nothing still yields a (time, height, empty snapshot),
+        // not None - only a missing coin book is an error to the subscriber.
+        let empty_band = PxBand::parse(Some("80000"), Some("90000")).unwrap();
+        let (_, _, snapshot) = state.compute_snapshot_for_coin(&Coin::new("BTC"), empty_band).unwrap();
+        let [bids, asks] = snapshot.as_ref();
+        assert!(bids.is_empty() && asks.is_empty());
     }
 
     // ==================== Performance Tests ====================

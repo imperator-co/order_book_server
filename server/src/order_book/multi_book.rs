@@ -1,5 +1,5 @@
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, PxBand, Snapshot, Sz},
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
@@ -132,8 +132,8 @@ impl<O: InnerOrder> OrderBooks<O> {
     /// multi-book (~hundreds of thousands of orders) under the listener lock on
     /// every l4Book subscribe, stalling event processing for its whole duration.
     #[must_use]
-    pub(crate) fn snapshot_for_coin(&self, coin: &Coin) -> Option<Snapshot<O>> {
-        self.order_books.get(coin).map(OrderBook::to_snapshot)
+    pub(crate) fn snapshot_for_coin(&self, coin: &Coin, band: PxBand) -> Option<Snapshot<O>> {
+        self.order_books.get(coin).map(|book| book.to_snapshot_in_band(band))
     }
 }
 
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(ans, raw_levels);
     }
 
-    use crate::order_book::{Oid, multi_book::OrderBooks};
+    use crate::order_book::{Oid, PxBand, multi_book::OrderBooks};
 
     fn make_order(oid: u64, coin: &str, side: Side, sz: &str, px: &str) -> InnerL4Order {
         let mut o = simple_inner_order(oid, side, sz.to_string(), px.to_string()).unwrap();
@@ -514,5 +514,28 @@ mod tests {
         books.compact_all();
         assert!(books.as_ref().contains_key(&Coin::new("ETH")));
         assert!(!books.as_ref().contains_key(&Coin::new("BTC")));
+    }
+
+    #[test]
+    fn test_snapshot_for_coin_with_band() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        books.add_order(make_order(1, "BTC", Side::Bid, "1", "50000"));
+        books.add_order(make_order(2, "BTC", Side::Bid, "1", "60000"));
+        books.add_order(make_order(3, "BTC", Side::Ask, "1", "70000"));
+        books.add_order(make_order(4, "ETH", Side::Bid, "1", "60000"));
+
+        let band = PxBand::parse(Some("55000"), Some("75000")).unwrap();
+        let [bids, asks] = books.snapshot_for_coin(&Coin::new("BTC"), band).unwrap().as_ref().clone();
+        assert_eq!(bids.iter().map(|o| o.oid).collect_vec(), vec![2], "px 50000 bid is out of band");
+        assert_eq!(asks.iter().map(|o| o.oid).collect_vec(), vec![3]);
+
+        // Other coins are untouched by a BTC band query, and the unbounded
+        // default band still returns the full book.
+        let [bids, _] = books.snapshot_for_coin(&Coin::new("ETH"), PxBand::default()).unwrap().as_ref().clone();
+        assert_eq!(bids.iter().map(|o| o.oid).collect_vec(), vec![4]);
+        let [bids, asks] = books.snapshot_for_coin(&Coin::new("BTC"), PxBand::default()).unwrap().as_ref().clone();
+        assert_eq!(bids.len() + asks.len(), 3);
+
+        assert!(books.snapshot_for_coin(&Coin::new("DOGE"), band).is_none(), "unknown coin yields None");
     }
 }

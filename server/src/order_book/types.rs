@@ -167,6 +167,41 @@ impl Px {
     }
 }
 
+/// Optional inclusive price band for L4 snapshot filtering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PxBand {
+    pub(crate) min: Option<Px>,
+    pub(crate) max: Option<Px>,
+}
+
+impl PxBand {
+    /// Parses optional wire-format bound strings. Errors if either bound is
+    /// unparseable or if both are present with min > max.
+    pub(crate) fn parse(min_px: Option<&str>, max_px: Option<&str>) -> Result<Self> {
+        let band = Self {
+            min: min_px.map(Px::parse_from_str).transpose()?,
+            max: max_px.map(Px::parse_from_str).transpose()?,
+        };
+        if band.is_inverted() {
+            return Err(
+                format!("minPx {} > maxPx {}", min_px.unwrap_or_default(), max_px.unwrap_or_default()).into()
+            );
+        }
+        Ok(band)
+    }
+
+    pub(crate) fn range_bounds(&self) -> (std::ops::Bound<Px>, std::ops::Bound<Px>) {
+        use std::ops::Bound::{Included, Unbounded};
+        (self.min.map_or(Unbounded, Included), self.max.map_or(Unbounded, Included))
+    }
+
+    /// True when both bounds are present and inverted (min > max). Callers must
+    /// treat this as an empty band — `BTreeMap::range` panics on inverted ranges.
+    pub(crate) fn is_inverted(&self) -> bool {
+        matches!((self.min, self.max), (Some(lo), Some(hi)) if lo > hi)
+    }
+}
+
 impl Sz {
     pub(crate) fn parse_from_str(value: &str) -> Result<Self> {
         Ok(Self::new(parse_fixed_point(value)?))
@@ -183,6 +218,37 @@ impl Sz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== PxBand Tests ====================
+
+    #[test]
+    fn test_px_band_parse_variants() {
+        let band = PxBand::parse(Some("64000"), Some("64000.0")).unwrap();
+        assert_eq!(band.min, band.max, "\"64000\" and \"64000.0\" parse to the same Px");
+        assert!(!band.is_inverted(), "min == max is a legal single-price band");
+
+        assert_eq!(PxBand::parse(None, None).unwrap(), PxBand::default());
+        assert_eq!(PxBand::parse(Some("100"), None).unwrap().max, None);
+        assert_eq!(PxBand::parse(None, Some("100")).unwrap().min, None);
+        assert!(PxBand::parse(Some("100"), Some("200.5")).is_ok());
+    }
+
+    #[test]
+    fn test_px_band_parse_rejects() {
+        assert!(PxBand::parse(Some("200"), Some("100")).is_err(), "min > max");
+        for bad in ["abc", "-1", "NaN", "inf", ""] {
+            assert!(PxBand::parse(Some(bad), None).is_err(), "min {bad:?} should be rejected");
+            assert!(PxBand::parse(None, Some(bad)).is_err(), "max {bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_px_band_range_bounds() {
+        use std::ops::Bound::{Included, Unbounded};
+        let band = PxBand::parse(Some("1"), None).unwrap();
+        assert_eq!(band.range_bounds(), (Included(Px::parse_from_str("1").unwrap()), Unbounded));
+        assert_eq!(PxBand::default().range_bounds(), (Unbounded, Unbounded));
+    }
 
     // ==================== Px Tests ====================
 

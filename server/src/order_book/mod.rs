@@ -9,7 +9,7 @@ pub(crate) mod multi_book;
 mod price_level;
 pub(crate) mod types;
 
-pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
+pub(crate) use types::{Coin, InnerOrder, Oid, Px, PxBand, Side, Sz};
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
@@ -165,9 +165,27 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 
     // we go by the convention that prioritized orders go first in the vector; this makes aggregation step later easier.
+    // Production always goes through to_snapshot_in_band (an absent band is
+    // unbounded); this full-book shorthand survives for the many round-trip tests.
+    #[cfg(test)]
     pub(crate) fn to_snapshot(&self) -> Snapshot<O> {
-        let bids = self.bids.iter().rev().flat_map(|(_, l)| l.to_vec().into_iter().cloned()).collect_vec();
-        let asks = self.asks.iter().flat_map(|(_, l)| l.to_vec().into_iter().cloned()).collect_vec();
+        self.to_snapshot_in_band(PxBand::default())
+    }
+
+    /// Snapshot restricted to price levels inside the (inclusive) band. Filtering
+    /// happens at the `BTreeMap::range` level so out-of-band levels are never
+    /// visited or cloned — a banded l4Book subscribe on a deep book copies a few
+    /// hundred orders instead of the full ~100k+, all under the listener lock.
+    pub(crate) fn to_snapshot_in_band(&self, band: PxBand) -> Snapshot<O> {
+        if band.is_inverted() {
+            // Validation rejects inverted bands at subscribe time; guard anyway
+            // because BTreeMap::range panics on start > end.
+            return Snapshot([Vec::new(), Vec::new()]);
+        }
+        let bids =
+            self.bids.range(band.range_bounds()).rev().flat_map(|(_, l)| l.to_vec().into_iter().cloned()).collect_vec();
+        let asks =
+            self.asks.range(band.range_bounds()).flat_map(|(_, l)| l.to_vec().into_iter().cloned()).collect_vec();
         Snapshot([bids, asks])
     }
 
@@ -576,6 +594,95 @@ mod tests {
         let snapshot = book.to_snapshot();
         let truncated = snapshot.truncate(3);
         assert_eq!(truncated.as_ref()[0].len(), 3); // bids
+    }
+
+    // ==================== Banded Snapshot Tests ====================
+
+    /// Bids at px 4/5/6, asks at px 7/8/9, one order each (oids 0..=5 in that order).
+    fn banded_test_book() -> OrderBook<MinimalOrder> {
+        let mut book = OrderBook::new();
+        let mut factory = OrderFactory::default();
+        for px in [4, 5, 6] {
+            book.add_order(factory.order(100, px, Side::Bid));
+        }
+        for px in [7, 8, 9] {
+            book.add_order(factory.order(100, px, Side::Ask));
+        }
+        book
+    }
+
+    fn pxs(orders: &[MinimalOrder]) -> Vec<u64> {
+        orders.iter().map(|o| o.limit_px).collect_vec()
+    }
+
+    fn band(min: Option<u64>, max: Option<u64>) -> PxBand {
+        PxBand { min: min.map(Px::new), max: max.map(Px::new) }
+    }
+
+    #[test]
+    fn test_to_snapshot_in_band_inclusive_bounds() {
+        let book = banded_test_book();
+        let [bids, asks] = book.to_snapshot_in_band(band(Some(5), Some(8))).0;
+        assert_eq!(pxs(&bids), vec![6, 5], "bids stay descending, boundary px 5 included");
+        assert_eq!(pxs(&asks), vec![7, 8], "asks stay ascending, boundary px 8 included");
+    }
+
+    #[test]
+    fn test_to_snapshot_in_band_one_sided_min() {
+        let book = banded_test_book();
+        let [bids, asks] = book.to_snapshot_in_band(band(Some(6), None)).0;
+        assert_eq!(pxs(&bids), vec![6]);
+        assert_eq!(pxs(&asks), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn test_to_snapshot_in_band_one_sided_max() {
+        let book = banded_test_book();
+        let [bids, asks] = book.to_snapshot_in_band(band(None, Some(7))).0;
+        assert_eq!(pxs(&bids), vec![6, 5, 4]);
+        assert_eq!(pxs(&asks), vec![7]);
+    }
+
+    #[test]
+    fn test_to_snapshot_in_band_min_equals_max() {
+        let book = banded_test_book();
+        let [bids, asks] = book.to_snapshot_in_band(band(Some(5), Some(5))).0;
+        assert_eq!(pxs(&bids), vec![5]);
+        assert!(asks.is_empty());
+        let [bids, asks] = book.to_snapshot_in_band(band(Some(8), Some(8))).0;
+        assert!(bids.is_empty());
+        assert_eq!(pxs(&asks), vec![8]);
+    }
+
+    #[test]
+    fn test_to_snapshot_in_band_outside_book() {
+        let book = banded_test_book();
+        let [bids, asks] = book.to_snapshot_in_band(band(Some(100), Some(200))).0;
+        assert!(bids.is_empty());
+        assert!(asks.is_empty());
+    }
+
+    #[test]
+    fn test_to_snapshot_in_band_inverted_returns_empty() {
+        // PxBand::parse rejects inverted bands; construct one directly to prove
+        // the snapshot path returns empty instead of hitting BTreeMap::range's panic.
+        let book = banded_test_book();
+        let [bids, asks] = book.to_snapshot_in_band(band(Some(8), Some(5))).0;
+        assert!(bids.is_empty());
+        assert!(asks.is_empty());
+    }
+
+    #[test]
+    fn test_to_snapshot_unbounded_band_matches_to_snapshot() {
+        let mut book = banded_test_book();
+        let mut factory = OrderFactory { next_oid: 100 };
+        // A second order on the px-5 level to check intra-level FIFO below.
+        book.add_order(factory.order(300, 5, Side::Bid));
+        assert_same_book(book.to_snapshot(), book.to_snapshot_in_band(PxBand::default()));
+
+        // Within a banded level, queue order (FIFO by insertion) is preserved.
+        let [bids, _] = book.to_snapshot_in_band(band(Some(5), Some(5))).0;
+        assert_eq!(bids.iter().map(|o| o.oid).collect_vec(), vec![1, 100]);
     }
 
     #[test]

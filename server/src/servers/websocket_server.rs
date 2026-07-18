@@ -7,7 +7,7 @@ use crate::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
         MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
-    order_book::{Coin, Snapshot},
+    order_book::{Coin, PxBand, Snapshot},
     prelude::*,
     types::{
         Bbo, L2Book, L4Book, L4BookUpdates, L4Order,
@@ -383,6 +383,10 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::L4OrderDiffs{ time, height, diffs_by_coin } => {
+                                // Multiple l4Book subs can share one coin (different
+                                // price bands); the update frame is whole-coin, so
+                                // send it once per coin, not once per subscription.
+                                let mut l4_sent: HashSet<&str> = HashSet::new();
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     match sub {
@@ -393,8 +397,11 @@ async fn handle_socket(
                                                 alive &= send_socket_frame(&mut socket, frame).await;
                                             }
                                         }
-                                        Subscription::L4Book { coin } => {
+                                        Subscription::L4Book { coin, .. } => {
                                             if let Some(cd) = diffs_by_coin.get(coin.as_str()) {
+                                                if !l4_sent.insert(coin.as_str()) {
+                                                    continue;
+                                                }
                                                 BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
                                                 let frame = cd.l4_frame.get_or_serialize(|| {
                                                     ServerResponse::L4Book(L4Book::Updates(L4BookUpdates {
@@ -412,11 +419,16 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::L4OrderStatuses{ time, height, statuses_by_coin } => {
+                                // Same per-coin dedup as L4OrderDiffs above.
+                                let mut l4_sent: HashSet<&str> = HashSet::new();
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     match sub {
-                                        Subscription::L4Book { coin } => {
+                                        Subscription::L4Book { coin, .. } => {
                                             if let Some(cs) = statuses_by_coin.get(coin.as_str()) {
+                                                if !l4_sent.insert(coin.as_str()) {
+                                                    continue;
+                                                }
                                                 BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
                                                 let frame = cs.l4_frame.get_or_serialize(|| {
                                                     ServerResponse::L4Book(L4Book::Updates(L4BookUpdates {
@@ -557,7 +569,7 @@ async fn receive_client_message(
     active_l2_params: &ActiveL2Params,
     l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
 ) -> bool {
-    let subscription = match &client_message {
+    let mut subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
         ClientMessage::Ping => unreachable!("Ping is handled before receive_client_message"),
     };
@@ -574,6 +586,12 @@ async fn receive_client_message(
     if !subscription.validate(universe) {
         return send_socket_message(socket, ServerResponse::Error(format!("Invalid subscription: {sub}"))).await;
     }
+    // Canonicalize AFTER validation and BEFORE the manager sees the subscription,
+    // for subscribes and unsubscribes alike: numerically equal bands must be one
+    // subscription (dedup) and unsubscribable with any equal spelling. The echoed
+    // subscriptionResponse keeps the client's original strings (client_message is
+    // untouched).
+    subscription.canonicalize();
 
     let (word, success) = match &client_message {
         ClientMessage::Subscribe { .. } => match manager.subscribe(subscription.clone()) {
@@ -836,12 +854,16 @@ impl Subscription {
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
-        if let Self::L4Book { coin } = self {
-            // Snapshot ONLY the requested coin. The old path cloned the entire
-            // multi-book (every coin, every order) under the listener lock,
-            // stalling event processing for hundreds of milliseconds per
-            // l4Book subscribe.
-            let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin));
+        if let Self::L4Book { coin, min_px, max_px } = self {
+            // Validation already rejected unparseable/inverted bands at subscribe
+            // time; a failure here is a logic bug and propagates as Err, which
+            // unsubscribes and reports to the client.
+            let band = PxBand::parse(min_px.as_deref(), max_px.as_deref())?;
+            // Snapshot ONLY the requested coin (and only the requested price band).
+            // The old path cloned the entire multi-book (every coin, every order)
+            // under the listener lock, stalling event processing for hundreds of
+            // milliseconds per l4Book subscribe.
+            let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin), band);
             if let Some((time, height, coin_snapshot)) = snapshot {
                 let levels =
                     coin_snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
