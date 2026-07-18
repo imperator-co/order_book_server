@@ -278,6 +278,8 @@ Optional parameters: `minPx`, `maxPx` (decimal strings, e.g. `"64000.0"`). When 
 
 The response body is identical to the WS l4Book message's `data` field (`{"Snapshot":{"coin","time","height","levels":[[bids],[asks]]}}`), so parsing can be shared with the WS path. Errors: `400` for an invalid band, `404` when the coin has no book.
 
+Send `Accept-Encoding: gzip` (curl: `--compressed`) — order JSON compresses ~6-10x, so wide bands go from MB to hundreds of KB on the wire; without it, transfer time dwarfs the ~10ms server build for remote clients.
+
 ### Subscribe to Order Updates (User-Specific)
 Stream raw order status data for a specific user address:
 ```json

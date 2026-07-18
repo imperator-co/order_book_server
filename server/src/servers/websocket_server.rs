@@ -178,7 +178,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             "/l4Book",
             get({
                 let listener = listener.clone();
-                move |query| l4_snapshot_handler(query, listener.clone())
+                move |query, headers| l4_snapshot_handler(query, headers, listener.clone())
             }),
         )
         .route(
@@ -885,6 +885,7 @@ struct L4SnapshotQuery {
 /// share their parsing with the WS path.
 async fn l4_snapshot_handler(
     axum::extract::Query(query): axum::extract::Query<L4SnapshotQuery>,
+    headers: axum::http::HeaderMap,
     listener: Arc<Mutex<OrderBookListener>>,
 ) -> axum::response::Response {
     fn json_response(status: axum::http::StatusCode, body: String) -> axum::response::Response {
@@ -906,7 +907,24 @@ async fn l4_snapshot_handler(
     };
     match compute_l4_book_snapshot(&listener, &query.coin, band).await {
         Some(snapshot) => match serde_json::to_string(&snapshot) {
-            Ok(body) => json_response(axum::http::StatusCode::OK, body),
+            Ok(body) => {
+                // Order JSON compresses ~10x; without this, transfer time
+                // dwarfs the ~10ms build for remote clients pulling MB-scale
+                // snapshots (a $2000 BTC band is ~2.4MB raw, ~250KB gzipped).
+                let accepts_gzip = headers
+                    .get(axum::http::header::ACCEPT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("gzip"));
+                if accepts_gzip && let Some(gz) = gzip_body(body.as_bytes()) {
+                    return axum::response::Response::builder()
+                        .status(axum::http::StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(gz.into())
+                        .unwrap_or_else(|_| axum::response::Response::new(String::new().into()));
+                }
+                json_response(axum::http::StatusCode::OK, body)
+            }
             Err(err) => {
                 error!("l4Book snapshot serialization error: {err}");
                 json_response(
@@ -920,6 +938,16 @@ async fn l4_snapshot_handler(
             format!(r#"{{"error":"no order book for coin {}"}}"#, query.coin),
         ),
     }
+}
+
+/// Gzip at the fastest level: on MB-scale order JSON the ~10x ratio is what
+/// matters, and level 1 keeps the CPU cost per request in single-digit ms.
+/// None on write failure (caller falls back to the uncompressed body).
+fn gzip_body(body: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::with_capacity(body.len() / 8), flate2::Compression::fast());
+    encoder.write_all(body).ok()?;
+    encoder.finish().ok()
 }
 
 /// Send order updates to an OrderUpdates subscriber, filtered by user address.
