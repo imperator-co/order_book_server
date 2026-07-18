@@ -1,5 +1,4 @@
 use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
-use crate::order_book::{Px, PxBand};
 use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus};
 use crate::types::{Bbo, L2Book, L4Book, Trade};
 use alloy::primitives::Address;
@@ -34,16 +33,7 @@ pub(crate) enum Subscription {
     #[serde(rename_all = "camelCase")]
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
-    L4Book {
-        coin: String,
-        // skip_serializing_if keeps the subscriptionResponse echo for band-less
-        // l4Book subscribes byte-identical to what pre-band clients already parse
-        // (unlike l2Book, whose null params were on the wire from day one).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        min_px: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_px: Option<String>,
-    },
+    L4Book { coin: String },
     #[serde(rename_all = "camelCase")]
     Bbo { coin: String },
     #[serde(rename_all = "camelCase")]
@@ -87,23 +77,7 @@ impl Subscription {
                 debug!("Valid subscription");
                 true
             }
-            Self::L4Book { coin, min_px, max_px } => {
-                if !universe.contains(coin) {
-                    debug!("Invalid subscription: coin not found");
-                    return false;
-                }
-                match PxBand::parse(min_px.as_deref(), max_px.as_deref()) {
-                    Ok(_) => {
-                        debug!("Valid subscription");
-                        true
-                    }
-                    Err(err) => {
-                        debug!("Invalid subscription: bad price band: {err}");
-                        false
-                    }
-                }
-            }
-            Self::Bbo { coin } | Self::BookDiffs { coin } => {
+            Self::L4Book { coin } | Self::Bbo { coin } | Self::BookDiffs { coin } => {
                 if !universe.contains(coin) {
                     debug!("Invalid subscription: coin not found");
                     return false;
@@ -123,26 +97,6 @@ impl Subscription {
                 }
                 debug!("Valid orderUpdates subscription for user: {}", user);
                 true
-            }
-        }
-    }
-}
-
-impl Subscription {
-    /// Rewrites the l4Book price band to canonical decimal form (`Px::to_str`),
-    /// so numerically equal bands hash/compare equal no matter how the client
-    /// spelled them ("64000", "64000.0", "6.4e4" are one subscription). Without
-    /// this, respelled bands would defeat subscribe dedup (each one recomputing
-    /// a snapshot under the listener lock) and make unsubscribe string-exact.
-    /// Unparseable bounds are left as-is; `validate` already rejects them.
-    pub(crate) fn canonicalize(&mut self) {
-        if let Self::L4Book { min_px, max_px, .. } = self {
-            for bound in [min_px, max_px] {
-                if let Some(s) = bound
-                    && let Ok(px) = Px::parse_from_str(s)
-                {
-                    *s = px.to_str();
-                }
             }
         }
     }
@@ -360,130 +314,19 @@ mod test {
 
     #[test]
     fn test_validate_l4book_valid() {
-        assert!(Subscription::L4Book { coin: "SOL".to_string(), min_px: None, max_px: None }.validate(&universe()));
-    }
-
-    fn l4_sub(coin: &str, min_px: Option<&str>, max_px: Option<&str>) -> Subscription {
-        Subscription::L4Book {
-            coin: coin.to_string(),
-            min_px: min_px.map(str::to_string),
-            max_px: max_px.map(str::to_string),
-        }
+        assert!(Subscription::L4Book { coin: "SOL".to_string() }.validate(&universe()));
     }
 
     #[test]
-    fn test_validate_l4book_band_valid() {
-        assert!(l4_sub("BTC", Some("60000"), Some("70000")).validate(&universe()));
-        assert!(l4_sub("BTC", Some("60000"), None).validate(&universe()));
-        assert!(l4_sub("BTC", None, Some("70000")).validate(&universe()));
-        assert!(l4_sub("BTC", Some("64000"), Some("64000")).validate(&universe()), "min == max is valid");
-    }
-
-    #[test]
-    fn test_validate_l4book_band_min_gt_max_rejected() {
-        assert!(!l4_sub("BTC", Some("70000"), Some("60000")).validate(&universe()));
-    }
-
-    #[test]
-    fn test_validate_l4book_band_non_numeric_rejected() {
-        for bad in ["abc", "-1", "NaN", "inf"] {
-            assert!(!l4_sub("BTC", Some(bad), None).validate(&universe()), "minPx {bad:?} should be rejected");
-            assert!(!l4_sub("BTC", None, Some(bad)).validate(&universe()), "maxPx {bad:?} should be rejected");
-        }
-    }
-
-    #[test]
-    fn test_validate_l4book_band_invalid_coin_rejected() {
-        assert!(!l4_sub("FAKE", Some("60000"), Some("70000")).validate(&universe()));
-    }
-
-    #[test]
-    fn test_l4book_band_deserialization() {
-        let msg: ClientMessage = serde_json::from_str(
-            r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC","minPx":"60000","maxPx":"70000"}}"#,
-        )
-        .unwrap();
-        let ClientMessage::Subscribe { subscription: Subscription::L4Book { coin, min_px, max_px } } = msg else {
-            panic!("expected banded l4Book subscribe");
-        };
-        assert_eq!(coin, "BTC");
-        assert_eq!(min_px.as_deref(), Some("60000"));
-        assert_eq!(max_px.as_deref(), Some("70000"));
-
-        // Backward compat: band-less messages keep parsing, band absent.
-        let msg: ClientMessage =
-            serde_json::from_str(r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#).unwrap();
-        assert!(matches!(
-            msg,
-            ClientMessage::Subscribe { subscription: Subscription::L4Book { min_px: None, max_px: None, .. } }
-        ));
-    }
-
-    #[test]
-    fn test_l4book_band_subscription_response_roundtrip() {
-        // Guards the subscriptionResponse echo path: the banded subscription must
-        // survive a serialize -> deserialize round trip unchanged.
-        let original = ClientMessage::Subscribe { subscription: l4_sub("BTC", Some("60000"), None) };
-        let json = serde_json::to_string(&ServerResponse::SubscriptionResponse(original)).unwrap();
-        assert!(json.contains(r#""minPx":"60000""#));
-        assert!(!json.contains("maxPx"), "absent bounds must stay off the wire");
-        let ServerResponse::SubscriptionResponse(ClientMessage::Subscribe { subscription }) =
-            serde_json::from_str(&json).unwrap()
-        else {
-            panic!("expected subscriptionResponse round trip");
-        };
-        assert_eq!(subscription, l4_sub("BTC", Some("60000"), None));
-    }
-
-    #[test]
-    fn test_l4book_bandless_echo_shape_unchanged() {
-        // Backward compat: the echo for a band-less l4Book subscribe must be
-        // byte-identical to the pre-band wire format (no minPx/maxPx nulls).
-        let msg = ClientMessage::Subscribe { subscription: l4_sub("BTC", None, None) };
+    fn test_l4book_echo_shape() {
+        // The l4Book subscriptionResponse echo carries only the coin; banded
+        // one-shot reads live on GET /l4Book, not on the subscription.
+        let msg = ClientMessage::Subscribe { subscription: Subscription::L4Book { coin: "BTC".to_string() } };
         let json = serde_json::to_string(&ServerResponse::SubscriptionResponse(msg)).unwrap();
         assert_eq!(
             json,
             r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}}"#
         );
-    }
-
-    #[test]
-    fn test_l4book_band_canonicalize() {
-        // Respelled but numerically equal bands canonicalize to one subscription.
-        let mut a = l4_sub("BTC", Some("64000"), Some("65000.0"));
-        let mut b = l4_sub("BTC", Some("64000.0"), Some("6.5e4"));
-        a.canonicalize();
-        b.canonicalize();
-        assert_eq!(a, b);
-        assert_eq!(a, l4_sub("BTC", Some("64000"), Some("65000")));
-        // Unparseable bounds are left alone (validate rejects them anyway).
-        let mut bad = l4_sub("BTC", Some("abc"), None);
-        bad.canonicalize();
-        assert_eq!(bad, l4_sub("BTC", Some("abc"), None));
-        // Non-l4Book subscriptions are untouched.
-        let mut bbo = Subscription::Bbo { coin: "BTC".to_string() };
-        bbo.canonicalize();
-        assert_eq!(bbo, Subscription::Bbo { coin: "BTC".to_string() });
-    }
-
-    #[test]
-    fn test_l4book_band_distinct_subscriptions() {
-        // The manager compares exact field equality (Eq/Hash over the band
-        // strings); the WS layer canonicalizes before it gets here, so respelled
-        // bands dedup to one subscription and unsubscribe with any numerically
-        // equal spelling matches.
-        let mut mgr = super::SubscriptionManager::default();
-        assert_eq!(mgr.subscribe(l4_sub("BTC", None, None)), Ok(true));
-
-        let mut sub = l4_sub("BTC", Some("64000"), None);
-        sub.canonicalize();
-        assert_eq!(mgr.subscribe(sub), Ok(true), "banded sub is distinct from full-book");
-
-        let mut respelled = l4_sub("BTC", Some("64000.0"), None);
-        respelled.canonicalize();
-        assert_eq!(mgr.subscribe(respelled.clone()), Ok(false), "respelled equal band dedups, no new sub");
-        assert!(mgr.unsubscribe(respelled), "unsubscribe matches via canonical form");
-        assert!(mgr.unsubscribe(l4_sub("BTC", None, None)));
     }
 
     #[test]
@@ -583,10 +426,7 @@ mod test {
     fn test_type_labels() {
         assert_eq!(Subscription::Bbo { coin: "".to_string() }.type_label(), "bbo");
         assert_eq!(Subscription::L2Book { coin: "".to_string(), n_sig_figs: None, n_levels: None, mantissa: None }.type_label(), "l2Book");
-        assert_eq!(
-            Subscription::L4Book { coin: "".to_string(), min_px: None, max_px: None }.type_label(),
-            "l4Book"
-        );
+        assert_eq!(Subscription::L4Book { coin: "".to_string() }.type_label(), "l4Book");
         assert_eq!(Subscription::Trades { coin: "".to_string() }.type_label(), "trades");
         assert_eq!(Subscription::OrderUpdates { user: "".to_string() }.type_label(), "orderUpdates");
         assert_eq!(Subscription::BookDiffs { coin: "".to_string() }.type_label(), "bookDiffs");

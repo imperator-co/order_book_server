@@ -14,7 +14,7 @@ Real-time orderbook data from a local Hyperliquid node:
 - **l2Book** - Aggregated Level 2 orderbook with deduplication
 - **trades** - Real-time trade feed
 - **bookDiffs** - Raw book diff stream per coin
-- **l4Book** - Full Level 4 orderbook with individual order details (optional `minPx`/`maxPx` snapshot band filter)
+- **l4Book** - Full Level 4 orderbook with individual order details (price-banded one-shot reads via `GET /l4Book`)
 - **orderUpdates** - User-specific order status stream
 
 ## Quick Start
@@ -267,13 +267,16 @@ Aggregation matches HL's public API semantics: the **full** book is bucketed by 
 ```json
 { "method": "subscribe", "subscription": { "type": "l4Book", "coin": "BTC" } }
 ```
-Optional parameters: `minPx`, `maxPx` (decimal strings, e.g. `"64000.0"`). When present, the initial snapshot includes only orders with `limitPx` in the inclusive range `[minPx, maxPx]`. Either bound may be given alone for a one-sided range; `minPx` must be <= `maxPx`. The band is applied before the snapshot is built, so a narrow band on a deep book returns in kilobytes instead of tens of megabytes:
-```json
-{ "method": "subscribe", "subscription": { "type": "l4Book", "coin": "BTC", "minPx": "64000", "maxPx": "66000" } }
-```
-> **Note:** The band applies to the **initial snapshot only** — subsequent update messages (order statuses / book diffs) still cover the whole coin. Clients tracking a price band must filter updates by price themselves, or unsubscribe after receiving the snapshot if they only need a one-shot banded view.
+> **Warning:** The initial L4 snapshot contains every individual order in the book and can be **very large** (several MB for liquid coins like BTC/ETH). Some WebSocket clients (e.g., Postman) may not handle payloads of this size. Use a capable client like `wscat` or `websocat`, or connect programmatically. After the initial snapshot, subsequent updates are incremental and lightweight. If you only need part of the book (or a one-shot view), use `GET /l4Book` below instead of subscribing.
 
-> **Warning:** Without a band, the initial L4 snapshot contains every individual order in the book and can be **very large** (several MB for liquid coins like BTC/ETH). Some WebSocket clients (e.g., Postman) may not handle payloads of this size. Use `minPx`/`maxPx` if you only need part of the book; otherwise use a capable client like `wscat` or `websocat`, or connect programmatically. After the initial snapshot, subsequent updates are incremental and lightweight.
+### One-shot L4 Snapshot (HTTP)
+For request/response use cases — e.g. a click-to-inspect overlay that needs the resting orders around one price — there is a plain HTTP endpoint. No subscription lifecycle, no update stream: every request returns the book slice **as of now**, so repeating the same request later simply returns current state:
+```
+GET /l4Book?coin=BTC&minPx=64000&maxPx=66000
+```
+Optional parameters: `minPx`, `maxPx` (decimal strings, e.g. `"64000.0"`). When present, the snapshot includes only orders with `limitPx` in the inclusive range `[minPx, maxPx]`; either bound may be given alone for a one-sided range, and `minPx` must be <= `maxPx`. The band is applied before the snapshot is built, so a narrow band on a deep book returns kilobytes in milliseconds instead of tens of megabytes. Omitting both bounds returns the full book.
+
+The response body is identical to the WS l4Book message's `data` field (`{"Snapshot":{"coin","time","height","levels":[[bids],[asks]]}}`), so parsing can be shared with the WS path. Errors: `400` for an invalid band, `404` when the coin has no book.
 
 ### Subscribe to Order Updates (User-Specific)
 Stream raw order status data for a specific user address:
@@ -301,7 +304,7 @@ Response:
 ```json
 { "method": "unsubscribe", "subscription": { "type": "l2Book", "coin": "BTC" } }
 ```
-An unsubscribe must match the original subscription, including any optional parameters. `l4Book` band values are canonicalized server-side, so any numerically equal spelling matches (`"64000"`, `"64000.0"` and `"6.4e4"` refer to the same subscription — subscribing them repeatedly dedups to one). Subscriptions with genuinely different bands on the same coin are independent and each counts against the per-connection subscription limit, but each gets its own initial snapshot only — whole-coin update frames are delivered **once per connection per coin**, no matter how many banded subscriptions overlap it.
+An unsubscribe must match the original subscription, including any optional parameters.
 
 ## Node Requirements
 

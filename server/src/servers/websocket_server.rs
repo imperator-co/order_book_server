@@ -175,6 +175,13 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             }),
         )
         .route(
+            "/l4Book",
+            get({
+                let listener = listener.clone();
+                move |query| l4_snapshot_handler(query, listener.clone())
+            }),
+        )
+        .route(
             "/health",
             get(move || {
                 let listener = listener_for_health.clone();
@@ -383,10 +390,6 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::L4OrderDiffs{ time, height, diffs_by_coin } => {
-                                // Multiple l4Book subs can share one coin (different
-                                // price bands); the update frame is whole-coin, so
-                                // send it once per coin, not once per subscription.
-                                let mut l4_sent: HashSet<&str> = HashSet::new();
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     match sub {
@@ -397,11 +400,8 @@ async fn handle_socket(
                                                 alive &= send_socket_frame(&mut socket, frame).await;
                                             }
                                         }
-                                        Subscription::L4Book { coin, .. } => {
+                                        Subscription::L4Book { coin } => {
                                             if let Some(cd) = diffs_by_coin.get(coin.as_str()) {
-                                                if !l4_sent.insert(coin.as_str()) {
-                                                    continue;
-                                                }
                                                 BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
                                                 let frame = cd.l4_frame.get_or_serialize(|| {
                                                     ServerResponse::L4Book(L4Book::Updates(L4BookUpdates {
@@ -419,16 +419,11 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::L4OrderStatuses{ time, height, statuses_by_coin } => {
-                                // Same per-coin dedup as L4OrderDiffs above.
-                                let mut l4_sent: HashSet<&str> = HashSet::new();
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     match sub {
-                                        Subscription::L4Book { coin, .. } => {
+                                        Subscription::L4Book { coin } => {
                                             if let Some(cs) = statuses_by_coin.get(coin.as_str()) {
-                                                if !l4_sent.insert(coin.as_str()) {
-                                                    continue;
-                                                }
                                                 BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
                                                 let frame = cs.l4_frame.get_or_serialize(|| {
                                                     ServerResponse::L4Book(L4Book::Updates(L4BookUpdates {
@@ -569,7 +564,7 @@ async fn receive_client_message(
     active_l2_params: &ActiveL2Params,
     l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
 ) -> bool {
-    let mut subscription = match &client_message {
+    let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
         ClientMessage::Ping => unreachable!("Ping is handled before receive_client_message"),
     };
@@ -586,12 +581,6 @@ async fn receive_client_message(
     if !subscription.validate(universe) {
         return send_socket_message(socket, ServerResponse::Error(format!("Invalid subscription: {sub}"))).await;
     }
-    // Canonicalize AFTER validation and BEFORE the manager sees the subscription,
-    // for subscribes and unsubscribes alike: numerically equal bands must be one
-    // subscription (dedup) and unsubscribable with any equal spelling. The echoed
-    // subscriptionResponse keeps the client's original strings (client_message is
-    // untouched).
-    subscription.canonicalize();
 
     let (word, success) = match &client_message {
         ClientMessage::Subscribe { .. } => match manager.subscribe(subscription.clone()) {
@@ -854,29 +843,82 @@ impl Subscription {
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
-        if let Self::L4Book { coin, min_px, max_px } = self {
-            // Validation already rejected unparseable/inverted bands at subscribe
-            // time; a failure here is a logic bug and propagates as Err, which
-            // unsubscribes and reports to the client.
-            let band = PxBand::parse(min_px.as_deref(), max_px.as_deref())?;
-            // Snapshot ONLY the requested coin (and only the requested price band).
-            // The old path cloned the entire multi-book (every coin, every order)
-            // under the listener lock, stalling event processing for hundreds of
-            // milliseconds per l4Book subscribe.
-            let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin), band);
-            if let Some((time, height, coin_snapshot)) = snapshot {
-                let levels =
-                    coin_snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-                return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
-                    coin: coin.clone(),
-                    time,
-                    height,
-                    levels,
-                })));
+        if let Self::L4Book { coin } = self {
+            if let Some(snapshot) = compute_l4_book_snapshot(&listener, coin, PxBand::default()).await {
+                return Ok(Some(ServerResponse::L4Book(snapshot)));
             }
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+/// Banded L4 snapshot of one coin, shared by the WS subscribe path and the
+/// one-shot HTTP endpoint. Snapshots ONLY the requested coin (and only the
+/// requested price band) under the listener lock; the `L4Order` conversion
+/// runs after the lock is released. None when the coin has no book.
+async fn compute_l4_book_snapshot(
+    listener: &Arc<Mutex<OrderBookListener>>,
+    coin: &str,
+    band: PxBand,
+) -> Option<L4Book> {
+    let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin), band);
+    snapshot.map(|(time, height, coin_snapshot)| {
+        let levels = coin_snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+        L4Book::Snapshot { coin: coin.to_string(), time, height, levels }
+    })
+}
+
+/// Query parameters for the one-shot GET /l4Book endpoint.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct L4SnapshotQuery {
+    coin: String,
+    min_px: Option<String>,
+    max_px: Option<String>,
+}
+
+/// One-shot banded L4 snapshot over plain HTTP: every request returns the book
+/// slice as of NOW, so repeat requests get current state with no subscription
+/// lifecycle and no update stream to filter. The body is the same JSON as the
+/// WS l4Book message's `data` field (`{"Snapshot":{...}}`), so clients can
+/// share their parsing with the WS path.
+async fn l4_snapshot_handler(
+    axum::extract::Query(query): axum::extract::Query<L4SnapshotQuery>,
+    listener: Arc<Mutex<OrderBookListener>>,
+) -> axum::response::Response {
+    fn json_response(status: axum::http::StatusCode, body: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(body.into())
+            .unwrap_or_else(|_| axum::response::Response::new(String::new().into()))
+    }
+
+    let band = match PxBand::parse(query.min_px.as_deref(), query.max_px.as_deref()) {
+        Ok(band) => band,
+        Err(err) => {
+            return json_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(r#"{{"error":"invalid price band: {err}"}}"#),
+            );
+        }
+    };
+    match compute_l4_book_snapshot(&listener, &query.coin, band).await {
+        Some(snapshot) => match serde_json::to_string(&snapshot) {
+            Ok(body) => json_response(axum::http::StatusCode::OK, body),
+            Err(err) => {
+                error!("l4Book snapshot serialization error: {err}");
+                json_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"serialization failed"}"#.to_string(),
+                )
+            }
+        },
+        None => json_response(
+            axum::http::StatusCode::NOT_FOUND,
+            format!(r#"{{"error":"no order book for coin {}"}}"#, query.coin),
+        ),
     }
 }
 
@@ -937,5 +979,29 @@ mod tests {
         assert_eq!(l2_cache_key("BTC", Some(5), None, None), l2_cache_key("BTC", Some(5), None, Some(DEFAULT_LEVELS)));
         assert_ne!(l2_cache_key("BTC", Some(5), None, None), l2_cache_key("ETH", Some(5), None, None));
         assert_ne!(l2_cache_key("BTC", Some(5), Some(2), None), l2_cache_key("BTC", Some(5), Some(5), None));
+    }
+
+    #[test]
+    fn test_http_l4_snapshot_body_matches_ws_data_field() {
+        // The GET /l4Book body is documented as identical to the WS l4Book
+        // message's `data` field, so clients can share parsing across both.
+        let make = || L4Book::Snapshot { coin: "BTC".to_string(), time: 1, height: 2, levels: [Vec::new(), Vec::new()] };
+        let http_body = serde_json::to_string(&make()).unwrap();
+        let ws_frame = serde_json::to_string(&ServerResponse::L4Book(make())).unwrap();
+        assert_eq!(ws_frame, format!(r#"{{"channel":"l4Book","data":{http_body}}}"#));
+        assert!(http_body.starts_with(r#"{"Snapshot":"#));
+    }
+
+    #[test]
+    fn test_l4_snapshot_query_camel_case() {
+        // GET /l4Book?coin=BTC&minPx=..&maxPx=.. - the query params are
+        // camelCase like every other wire-facing name.
+        let q: L4SnapshotQuery =
+            serde_json::from_str(r#"{"coin":"BTC","minPx":"64000","maxPx":"66000"}"#).unwrap();
+        assert_eq!(q.coin, "BTC");
+        assert_eq!(q.min_px.as_deref(), Some("64000"));
+        assert_eq!(q.max_px.as_deref(), Some("66000"));
+        let bare: L4SnapshotQuery = serde_json::from_str(r#"{"coin":"BTC"}"#).unwrap();
+        assert!(bare.min_px.is_none() && bare.max_px.is_none());
     }
 }
