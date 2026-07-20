@@ -2,9 +2,9 @@ use crate::{
     listeners::order_book::state::OrderBookState,
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE, ORDERBOOK_COINS_COUNT,
-        ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
-        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
+        FILE_LINES_PARSED_TOTAL, INSERT_BEFORE_FALLBACK_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE,
+        ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS,
+        PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
@@ -312,6 +312,11 @@ impl OrderBookListener {
             }
         }
         info!("Replayed {replayed} cached events above snapshot height {height}");
+        // Drain fallbacks accumulated during replay: an anchored diff whose anchor
+        // was consumed at or below the snapshot height falls back benignly-looking,
+        // but the fresh book's queue priority is already off. Draining here also
+        // keeps the count from being misattributed to the first live batch.
+        let replay_fallbacks = new_state.take_insert_before_fallbacks();
         let prior_loss_height = self.max_loss_height;
         self.order_book_state = Some(new_state);
 
@@ -321,8 +326,13 @@ impl OrderBookListener {
         // clearing the flag in that case would erase the signal permanently.
         self.needs_resync = false;
         self.max_loss_height = 0;
+        if replay_fallbacks > 0 {
+            INSERT_BEFORE_FALLBACK_TOTAL.inc_by(replay_fallbacks);
+        }
         if replay_failed {
             self.mark_desynced("replay_apply_error");
+        } else if replay_fallbacks > 0 {
+            self.mark_desynced("insert_before_fallback");
         } else if prior_loss_height > height {
             error!(
                 "Data loss bounded by height {prior_loss_height} is above snapshot height {height}; \
@@ -798,6 +808,15 @@ impl OrderBookListener {
                     Ok(HashSet::new())
                 }
             };
+
+            // Adds whose insertBefore anchor was missing rested at the back of
+            // their level instead - the book kept serving, but queue priority
+            // has diverged from the stream, so schedule a background re-sync.
+            let fallbacks = state.take_insert_before_fallbacks();
+            if fallbacks > 0 {
+                INSERT_BEFORE_FALLBACK_TOTAL.inc_by(fallbacks);
+                desync_reason = Some("insert_before_fallback");
+            }
 
             match result {
                 Ok(coins) => coins,
@@ -1526,6 +1545,38 @@ mod tests {
             }
         }
         panic!("no Snapshot message was broadcast");
+    }
+
+    // ==================== insertBefore fallback → re-sync wiring ====================
+
+    #[test]
+    fn insert_before_fallback_marks_desync() {
+        let (mut listener, _rx) = ready_listener();
+        feed_order(&mut listener, "BTC", 1, 1);
+
+        // A honored anchor is business as usual - no re-sync
+        listener.apply_event_batch(2, EventBatch::Orders(make_status_batch("BTC", 2, 2)), EventSource::OrderStatuses);
+        listener.apply_event_batch(
+            2,
+            EventBatch::BookDiffs(make_diff_batch("BTC", 2, 2, serde_json::json!({"new": {"sz": "1.0", "insertBefore": 1}}))),
+            EventSource::OrderDiffs,
+        );
+        assert!(!listener.needs_resync(), "a honored insertBefore anchor must not schedule a re-sync");
+
+        // A missing anchor rests the order at the back of the level and marks
+        // the book for re-sync - queue priority has diverged from the stream
+        listener.apply_event_batch(3, EventBatch::Orders(make_status_batch("BTC", 3, 3)), EventSource::OrderStatuses);
+        listener.apply_event_batch(
+            3,
+            EventBatch::BookDiffs(make_diff_batch(
+                "BTC",
+                3,
+                3,
+                serde_json::json!({"new": {"sz": "1.0", "insertBefore": 999}}),
+            )),
+            EventSource::OrderDiffs,
+        );
+        assert!(listener.needs_resync(), "a missing insertBefore anchor must schedule a re-sync");
     }
 
     // ==================== Gapless snapshot handoff (drift fix) ====================

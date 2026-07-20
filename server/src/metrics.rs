@@ -150,6 +150,14 @@ lazy_static! {
         "Messages dropped due to channel lag"
     ).expect("metric can be created");
 
+    /// New diffs whose insertBefore anchor was not resting at the level; the
+    /// order was rested at the back of the level instead and a re-sync was
+    /// scheduled, since queue priority may be wrong until then.
+    pub static ref INSERT_BEFORE_FALLBACK_TOTAL: IntCounter = IntCounter::new(
+        "insert_before_fallback_total",
+        "New diffs whose insertBefore anchor was missing; order rested at back of level"
+    ).expect("metric can be created");
+
     // ==================== FILE WATCHER METRICS ====================
 
     /// File events received per source (orders, diffs, fills)
@@ -237,6 +245,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(WS_SEND_ERRORS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
 
     // File watcher metrics
     REGISTRY.register(Box::new(FILE_EVENTS_TOTAL.clone())).ok();

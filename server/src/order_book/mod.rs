@@ -67,7 +67,17 @@ impl<O: InnerOrder> OrderBook<O> {
         self.oid_to_side_px.len()
     }
 
-    pub(crate) fn add_order(&mut self, mut order: O) {
+    pub(crate) fn add_order(&mut self, order: O) {
+        let fell_back = self.add_order_before(order, None);
+        debug_assert!(!fell_back);
+    }
+
+    /// Rests the order directly in front of `insert_before` at its price level
+    /// (at the back when None), as dictated by the node's book diff. Returns true
+    /// when a `Some` anchor was not resting at that level and the order was rested
+    /// at the back of the level instead - the book has diverged from the stream
+    /// and the caller should schedule a re-sync.
+    pub(crate) fn add_order_before(&mut self, mut order: O, insert_before: Option<Oid>) -> bool {
         // Duplicate oid would silently corrupt state: `oid_to_side_px` would point
         // at the new (side, px) while `LinkedList::push_back` silently rejects the
         // re-insert, leaving the original order data in place. Skip and warn.
@@ -76,7 +86,7 @@ impl<O: InnerOrder> OrderBook<O> {
         // orders that have arrived since.)
         if self.oid_to_side_px.contains_key(&order.oid()) {
             log::warn!("OrderBook::add_order called twice for oid={:?}; ignoring duplicate", order.oid());
-            return;
+            return false;
         }
         let (maker_orders, resting_book) = match order.side() {
             Side::Ask => (&mut self.bids, &mut self.asks),
@@ -88,8 +98,9 @@ impl<O: InnerOrder> OrderBook<O> {
         }
         if order.sz().is_positive() {
             self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
-            add_order_to_book(resting_book, order);
+            return add_order_to_book(resting_book, order, insert_before);
         }
+        false
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
@@ -204,10 +215,36 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 }
 
-fn add_order_to_book<O: InnerOrder>(map: &mut BTreeMap<Px, PriceLevel<O>>, order: O) {
+// Rests the order at its price level, in front of `insert_before` when given.
+// The order ALWAYS rests: a `Some` anchor that is not at the level (book diverged
+// from the stream, e.g. after a pending-cache eviction) degrades to the back of
+// the level and returns true so the caller can flag the divergence, instead of
+// dropping the order or leaving a phantom empty level behind.
+fn add_order_to_book<O: InnerOrder>(
+    map: &mut BTreeMap<Px, PriceLevel<O>>,
+    order: O,
+    insert_before: Option<Oid>,
+) -> bool {
     let oid = order.oid();
     let limit_px = order.limit_px();
-    map.entry(limit_px).or_insert_with(PriceLevel::new).push_back(oid, order);
+    let level = map.entry(limit_px).or_insert_with(PriceLevel::new);
+    match insert_before {
+        None => {
+            level.push_back(oid, order);
+            false
+        }
+        Some(before) if level.contains(&before) => {
+            // Duplicate oids never reach here (the add_order_before guard rejects
+            // any oid already in oid_to_side_px), so the splice cannot fail.
+            let inserted = level.insert_before(&before, oid, order);
+            debug_assert!(inserted);
+            false
+        }
+        Some(_) => {
+            level.push_back(oid, order);
+            true
+        }
+    }
 }
 
 fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, PriceLevel<O>>, taker_order: &mut O) -> Vec<Oid> {
@@ -373,6 +410,78 @@ mod tests {
         let [b2, a2] = s2.0.map(BTreeSet::from_iter);
         assert_eq!(b1, b2);
         assert_eq!(a1, a2);
+    }
+
+    // ==================== insertBefore (ALO priority) Tests ====================
+
+    #[test]
+    fn insert_before_book_test() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+        // oids 0..=2 rest at the same level in arrival order
+        let orders = factory.batch_order(100, 5, Side::Bid, 3);
+        for order in orders.clone() {
+            book.add_order(order);
+        }
+
+        // A priority order jumps to the front of the level
+        let front = factory.order(100, 5, Side::Bid);
+        assert!(!book.add_order_before(front.clone(), Some(Oid::new(0))));
+        // Another lands in the middle
+        let middle = factory.order(100, 5, Side::Bid);
+        assert!(!book.add_order_before(middle.clone(), Some(Oid::new(1))));
+        let expected = vec![front, orders[0].clone(), middle.clone(), orders[1].clone(), orders[2].clone()];
+        assert_eq!(book.to_snapshot().0[0], expected);
+
+        // Unknown anchor: the order still rests, at the back of the level, and
+        // the fallback is reported
+        let back = factory.order(100, 5, Side::Bid);
+        assert!(book.add_order_before(back.clone(), Some(Oid::new(99))));
+        // Anchor resting at a different price level falls back as well
+        let other_level = factory.order(100, 4, Side::Bid);
+        let other_oid = other_level.oid();
+        book.add_order(other_level.clone());
+        let back2 = factory.order(100, 5, Side::Bid);
+        assert!(book.add_order_before(back2.clone(), Some(other_oid.clone())));
+        let expected = [expected, vec![back.clone(), back2.clone()]].concat();
+        assert_eq!(book.to_snapshot().0[0], [expected.clone(), vec![other_level.clone()]].concat());
+
+        // A duplicate add is ignored and must NOT report a fallback, even with a
+        // bogus anchor - a replayed event is not book divergence
+        assert!(!book.add_order_before(orders[1].clone(), Some(Oid::new(99))));
+
+        // The jumped-to-front order is the first maker filled; oid 0 is filled
+        // partially - queue priority now drives fill attribution
+        book.add_order(factory.order(150, 5, Side::Ask));
+        let snapshot = book.to_snapshot();
+        let bids = &snapshot.0[0];
+        assert_eq!(bids[0].oid(), orders[0].oid());
+        assert_eq!(bids[0].sz, 50);
+
+        // Canceling around inserted orders keeps the level consistent
+        assert!(book.cancel_order(middle.oid()));
+        assert!(book.cancel_order(orders[0].oid()));
+        let bids = book.to_snapshot().0[0].iter().map(InnerOrder::oid).collect_vec();
+        assert_eq!(bids, vec![orders[1].oid(), orders[2].oid(), back.oid(), back2.oid(), other_oid]);
+    }
+
+    #[test]
+    fn insert_before_fallback_level_test() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+        let resting = factory.order(100, 5, Side::Bid);
+        book.add_order(resting.clone());
+        // A missing anchor at a fresh price level rests the order there anyway -
+        // no dropped order and no phantom empty level
+        let fresh = factory.order(100, 6, Side::Bid);
+        assert!(book.add_order_before(fresh.clone(), Some(Oid::new(42))));
+        // Bids are price-descending, so the fallen-back order's level comes first
+        assert_eq!(book.to_snapshot().0[0], vec![fresh.clone(), resting.clone()]);
+        // The BBO aggregate includes the fallen-back order (exercises the
+        // PriceLevel total_sz bump on the fallback path)
+        let (bid, ask) = book.get_bbo();
+        assert_eq!(bid, Some((Px::new(6), Sz::new(100), 1)));
+        assert!(ask.is_none());
     }
 
     // ==================== BBO Tests ====================

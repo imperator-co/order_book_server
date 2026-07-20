@@ -56,6 +56,34 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         }
     }
 
+    // Inserts `key` directly in front of `before`. Fails when `before` is not in the list or
+    // `key` already is. `tail` can never change: the new node always lands in front of an
+    // existing one.
+    pub(crate) fn insert_before(&mut self, before: &K, key: K, value: T) -> bool {
+        if self.key_to_sid.contains_key(&key) {
+            return false;
+        }
+        let Some(&before_sid) = self.key_to_sid.get(before) else {
+            return false;
+        };
+        let mut node = Node::new(key.clone(), value);
+        let prev = self.slab[before_sid].prev;
+        node.prev = prev;
+        node.next = Some(before_sid);
+        let sid = self.slab.insert(node);
+        self.key_to_sid.insert(key, sid);
+        self.slab[before_sid].prev = Some(sid);
+        match prev {
+            Some(p) => self.slab[p].next = Some(sid),
+            None => self.head = Some(sid),
+        }
+        true
+    }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.key_to_sid.contains_key(key)
+    }
+
     #[must_use]
     pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
@@ -257,6 +285,39 @@ mod tests {
         }
 
         assert!(list.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_before_test() -> Result<()> {
+        let mut list = LinkedList::new();
+        // Missing anchor on an empty list
+        assert!(!list.insert_before(&0, 1, 1));
+        for elt in [10, 20, 30] {
+            list.push_back(elt, elt);
+        }
+        // Insert at head
+        assert!(list.insert_before(&10, 5, 5));
+        // Insert in the middle
+        assert!(list.insert_before(&30, 25, 25));
+        // Missing anchor
+        assert!(!list.insert_before(&99, 40, 40));
+        // Duplicate key
+        assert!(!list.insert_before(&10, 25, 25));
+        let expected = VecDeque::from([5, 10, 20, 25, 30]);
+        assert_vec_deque_list_eq(&expected, &list);
+
+        // Removals still work around inserted nodes (head, middle, and the
+        // prev/next links they touch)
+        list.remove_front()?;
+        assert!(list.remove_node(25).is_some());
+        let expected = VecDeque::from([10, 20, 30]);
+        assert_vec_deque_list_eq(&expected, &list);
+
+        // Re-inserting a previously removed key in front of the tail
+        assert!(list.insert_before(&30, 25, 26));
+        let expected = VecDeque::from([10, 20, 26, 30]);
+        assert_vec_deque_list_eq(&expected, &list);
         Ok(())
     }
 

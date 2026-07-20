@@ -170,6 +170,10 @@ pub(crate) enum OrderDiff {
     #[serde(rename_all = "camelCase")]
     New {
         sz: String,
+        // Oid of the resting order at the same price level that this order is placed directly in
+        // front of (set for priority ALO orders). Absent means the back of the level.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        insert_before: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
     Update {
@@ -209,4 +213,32 @@ pub(crate) struct Liquidation {
     pub liquidated_user: String,
     pub mark_px: String,
     pub method: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_diff_insert_before_serde_test() {
+        // Legacy shape without the field
+        let legacy = r#"{"new":{"sz":"1.5"}}"#;
+        let diff: OrderDiff = serde_json::from_str(legacy).unwrap();
+        let OrderDiff::New { sz, insert_before } = &diff else {
+            panic!("expected New, got {diff:?}");
+        };
+        assert_eq!(sz, "1.5");
+        assert_eq!(*insert_before, None);
+        // None round-trips back to the legacy shape
+        assert_eq!(serde_json::to_string(&diff).unwrap(), legacy);
+
+        // New shape with insertBefore
+        let with_anchor = r#"{"new":{"sz":"1.5","insertBefore":105338503859}}"#;
+        let diff: OrderDiff = serde_json::from_str(with_anchor).unwrap();
+        let OrderDiff::New { insert_before, .. } = &diff else {
+            panic!("expected New, got {diff:?}");
+        };
+        assert_eq!(*insert_before, Some(105_338_503_859));
+        assert_eq!(serde_json::to_string(&diff).unwrap(), with_anchor);
+    }
 }

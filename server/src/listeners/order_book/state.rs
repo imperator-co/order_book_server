@@ -25,9 +25,15 @@ pub(super) struct OrderBookState {
     // Entries carry their insertion time so cleanup can evict by age instead of
     // nuking the whole map (which killed in-flight halves and forced re-syncs).
     pending_order_statuses: HashMap<Oid, (NodeDataOrderStatus, Instant)>,
-    // Persistent cache of New diffs (sz values) waiting for their OrderStatuses
-    // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
-    pending_new_diffs: HashMap<Oid, (crate::order_book::types::Sz, Instant)>,
+    // Persistent cache of New diffs (sz + optional insertBefore anchor) waiting for their
+    // OrderStatuses. This is the other half of bidirectional caching - handles when Diff
+    // arrives BEFORE Status. The anchor must survive the cache so a late-pairing priority
+    // ALO order still splices into the right queue position.
+    pending_new_diffs: HashMap<Oid, (crate::order_book::types::Sz, Option<Oid>, Instant)>,
+    // insertBefore anchors that were missing from the book (add fell back to the back of
+    // the level). Drained per batch by the listener, which converts a nonzero count into
+    // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
+    insert_before_fallbacks: u64,
 }
 
 impl OrderBookState {
@@ -45,7 +51,21 @@ impl OrderBookState {
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: HashMap::new(),
             pending_new_diffs: HashMap::new(),
+            insert_before_fallbacks: 0,
         }
+    }
+
+    /// Drain the count of adds whose insertBefore anchor was missing (the order
+    /// was rested at the back of its level instead). Nonzero means the book has
+    /// diverged from the stream and should be re-synced.
+    pub(super) fn take_insert_before_fallbacks(&mut self) -> u64 {
+        std::mem::take(&mut self.insert_before_fallbacks)
+    }
+
+    /// Record that `insert_before` could not be honored for this order.
+    fn note_insert_before_fallback(&mut self, oid: &Oid, coin: &Coin) {
+        self.insert_before_fallbacks += 1;
+        log::warn!("insertBefore anchor missing for oid={oid:?} coin={coin:?}; order rested at back of level");
     }
 
     pub(super) const fn height(&self) -> u64 {
@@ -155,7 +175,7 @@ impl OrderBookState {
         }
 
         let before = self.pending_new_diffs.len();
-        self.pending_new_diffs.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
+        self.pending_new_diffs.retain(|_, (_, _, at)| at.elapsed() < PENDING_MAX_AGE);
         let aged_diffs = before - self.pending_new_diffs.len();
         if aged_diffs > 0 {
             // A New diff with no status in 60s: the order is missing from the book.
@@ -223,14 +243,16 @@ impl OrderBookState {
             let oid = Oid::new(order_status.order.oid);
 
             // Check if there's a pending New diff for this order
-            if let Some((sz, _)) = self.pending_new_diffs.remove(&oid) {
+            if let Some((sz, insert_before, _)) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
                 let order_coin = Coin::new(&order_status.order.coin);
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(sz);
                 inner_order.convert_trigger(time.max(0) as u64);
-                self.order_book.add_order(inner_order);
+                if self.order_book.add_order_before(inner_order, insert_before) {
+                    self.note_insert_before_fallback(&oid, &order_coin);
+                }
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
             } else if order_status.is_inserted_into_book() {
@@ -254,7 +276,7 @@ impl OrderBookState {
         for (_, at) in self.pending_order_statuses.values_mut() {
             *at = backdated;
         }
-        for (_, at) in self.pending_new_diffs.values_mut() {
+        for (_, _, at) in self.pending_new_diffs.values_mut() {
             *at = backdated;
         }
     }
@@ -286,7 +308,7 @@ impl OrderBookState {
             }
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
-                InnerOrderDiff::New { sz } => {
+                InnerOrderDiff::New { sz, insert_before } => {
                     // Check if OrderStatus already arrived
                     if let Some((order, _)) = self.pending_order_statuses.remove(&oid) {
                         // Both arrived - add order immediately!
@@ -296,12 +318,14 @@ impl OrderBookState {
                         inner_order.modify_sz(sz);
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
-                        self.order_book.add_order(inner_order);
+                        if self.order_book.add_order_before(inner_order, insert_before) {
+                            self.note_insert_before_fallback(&oid, &order_coin);
+                        }
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
-                        // Status hasn't arrived yet - cache the diff size
-                        self.pending_new_diffs.insert(oid.clone(), (sz, Instant::now()));
+                        // Status hasn't arrived yet - cache the diff size + queue anchor
+                        self.pending_new_diffs.insert(oid.clone(), (sz, insert_before, Instant::now()));
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
@@ -421,12 +445,81 @@ mod tests {
         assert!(state.pending_order_statuses_has(&Oid::new(42)));
 
         // 2. OrderDiff::New arrives → order added immediately
-        let diff = make_order_diff("BTC", 42, OrderDiff::New { sz: "1.5".to_string() });
+        let diff = make_order_diff("BTC", 42, OrderDiff::New { sz: "1.5".to_string(), insert_before: None });
         let batch = make_diff_batch(vec![diff]);
         let changed = state.apply_order_diffs_hft(batch).unwrap();
         assert!(changed.contains(&Coin::new("BTC")));
         assert_eq!(state.pending_order_statuses_count(), 0); // consumed
         assert_eq!(state.order_count(), 1);
+    }
+
+    // ==================== insertBefore (ALO priority) ====================
+
+    /// Rest an order via the paired status+diff HFT flow (all helpers use px 100.0,
+    /// side Bid, so every order lands on the same level of the same book).
+    fn add_resting_order(state: &mut OrderBookState, coin: &str, oid: u64) {
+        let status = make_order_status(coin, oid, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff(coin, oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+    }
+
+    /// Bid-side queue order (front first) for the coin's single price level.
+    fn bid_queue_oids(state: &OrderBookState, coin: &str) -> Vec<Oid> {
+        let (_, _, snapshot) = state.compute_snapshot_for_coin(&Coin::new(coin), PxBand::default()).unwrap();
+        snapshot.as_ref()[0].iter().map(InnerOrder::oid).collect()
+    }
+
+    #[test]
+    fn test_insert_before_splices_ahead_of_anchor() {
+        let mut state = empty_state();
+        add_resting_order(&mut state, "BTC", 1);
+
+        // Priority order 2 jumps in front of resting order 1 (status first, then diff)
+        let status = make_order_status("BTC", 2, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff("BTC", 2, OrderDiff::New { sz: "1.0".to_string(), insert_before: Some(1) });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        assert_eq!(bid_queue_oids(&state, "BTC"), vec![Oid::new(2), Oid::new(1)]);
+        assert_eq!(state.take_insert_before_fallbacks(), 0);
+    }
+
+    #[test]
+    fn test_insert_before_survives_pending_diff_cache() {
+        let mut state = empty_state();
+        add_resting_order(&mut state, "BTC", 1);
+
+        // Diff for order 2 arrives BEFORE its status: the anchor must survive the cache
+        let diff = make_order_diff("BTC", 2, OrderDiff::New { sz: "1.0".to_string(), insert_before: Some(1) });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 1);
+        assert_eq!(state.order_count(), 1); // not added yet
+
+        let status = make_order_status("BTC", 2, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+
+        assert_eq!(bid_queue_oids(&state, "BTC"), vec![Oid::new(2), Oid::new(1)]);
+        assert_eq!(state.take_insert_before_fallbacks(), 0);
+    }
+
+    #[test]
+    fn test_insert_before_missing_anchor_falls_back() {
+        let mut state = empty_state();
+        add_resting_order(&mut state, "BTC", 1);
+
+        // Anchor 999 is not on the book: the order must still rest (at the back
+        // of the level) and the batch must NOT error out
+        let status = make_order_status("BTC", 2, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff("BTC", 2, OrderDiff::New { sz: "1.0".to_string(), insert_before: Some(999) });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        assert_eq!(state.order_count(), 2);
+        assert_eq!(bid_queue_oids(&state, "BTC"), vec![Oid::new(1), Oid::new(2)]);
+        // The divergence is surfaced exactly once, then the counter resets
+        assert_eq!(state.take_insert_before_fallbacks(), 1);
+        assert_eq!(state.take_insert_before_fallbacks(), 0);
     }
 
     // ==================== Bidirectional Cache: Diff First ====================
@@ -436,7 +529,7 @@ mod tests {
         let mut state = empty_state();
 
         // 1. OrderDiff::New arrives first → size cached
-        let diff = make_order_diff("ETH", 99, OrderDiff::New { sz: "2.0".to_string() });
+        let diff = make_order_diff("ETH", 99, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
         let batch = make_diff_batch(vec![diff]);
         let changed = state.apply_order_diffs_hft(batch).unwrap();
         assert!(changed.is_empty()); // not added yet
@@ -460,7 +553,7 @@ mod tests {
         // First add an order via the bidirectional path
         let status = make_order_status("BTC", 1, "open");
         state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "5.0".to_string() });
+        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "5.0".to_string(), insert_before: None });
         state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         assert_eq!(state.order_count(), 1);
 
@@ -476,7 +569,7 @@ mod tests {
         // Add order
         let status = make_order_status("BTC", 1, "open");
         state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "5.0".to_string() });
+        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "5.0".to_string(), insert_before: None });
         state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
 
         // Remove
@@ -513,7 +606,7 @@ mod tests {
         let snapshots = Snapshots::new(HashMap::new());
         let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true); // ignore_spot=true
 
-        let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string() });
+        let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         assert!(changed.is_empty());
         assert_eq!(state.pending_new_diffs_count(), 0); // skipped entirely
@@ -522,7 +615,7 @@ mod tests {
     #[test]
     fn test_spot_not_filtered_when_not_ignoring() {
         let mut state = empty_state(); // ignore_spot=false
-        let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string() });
+        let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         assert_eq!(state.pending_new_diffs_count(), 1); // cached
     }
@@ -584,7 +677,7 @@ mod tests {
     fn test_cleanup_evicts_aged_diffs_as_data_loss() {
         let mut state = empty_state();
         for i in 0..100u64 {
-            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         state.age_pending_entries(std::time::Duration::from_secs(61));
@@ -601,7 +694,7 @@ mod tests {
         for i in 0..100u64 {
             let status = make_order_status("BTC", i, "open");
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-            let diff = make_order_diff("ETH", 1_000 + i, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff("ETH", 1_000 + i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         assert!(!state.cleanup_stale_pending());
@@ -628,7 +721,7 @@ mod tests {
         for (i, coin) in ["BTC", "ETH"].iter().enumerate() {
             let status = make_order_status(coin, i as u64, "open");
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-            let diff = make_order_diff(coin, i as u64, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff(coin, i as u64, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
 
@@ -651,7 +744,7 @@ mod tests {
             let mut status = make_order_status("BTC", oid, "open");
             status.order.limit_px = px.to_string();
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-            let diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         let (full_time, full_height, _) =
@@ -686,7 +779,7 @@ mod tests {
         // Time matching diffs arrival
         let start = std::time::Instant::now();
         for i in 0..1000u64 {
-            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         let elapsed = start.elapsed();
@@ -705,7 +798,7 @@ mod tests {
         let mut state = empty_state();
         // Pre-populate with diffs
         for i in 0..1000u64 {
-            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
 
@@ -732,7 +825,7 @@ mod tests {
         for (i, coin) in ["BTC", "ETH", "SOL"].iter().enumerate() {
             let status = make_order_status(coin, i as u64, "open");
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-            let diff = make_order_diff(coin, i as u64, OrderDiff::New { sz: "1.0".to_string() });
+            let diff = make_order_diff(coin, i as u64, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         let universe = state.compute_universe();

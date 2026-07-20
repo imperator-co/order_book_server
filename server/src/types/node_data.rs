@@ -235,7 +235,7 @@ mod tests {
         let diff: NodeDataOrderDiff = serde_json::from_str(json).unwrap();
         assert_eq!(diff.oid(), Oid::new(123));
         assert_eq!(diff.coin(), Coin::new("BTC"));
-        assert!(matches!(diff.diff(), OrderDiff::New { sz } if sz == "1.5"));
+        assert!(matches!(diff.diff(), OrderDiff::New { sz, insert_before: None } if sz == "1.5"));
     }
 
     #[test]

@@ -34,6 +34,24 @@ impl<O: InnerOrder> PriceLevel<O> {
         inserted
     }
 
+    /// Insert an order directly in front of `before` in the queue. The aggregate
+    /// is bumped only when the splice succeeded - a missing anchor or duplicate
+    /// oid is rejected by the list and must not inflate the sum.
+    pub(crate) fn insert_before(&mut self, before: &Oid, oid: Oid, order: O) -> bool {
+        let sz = order.sz().value();
+        let inserted = self.orders.insert_before(before, oid, order);
+        if inserted {
+            self.total_sz = self.total_sz.saturating_add(sz);
+        }
+        self.debug_validate();
+        inserted
+    }
+
+    /// Whether an order with this oid is resting at this level.
+    pub(crate) fn contains(&self, oid: &Oid) -> bool {
+        self.orders.contains_key(oid)
+    }
+
     /// Remove an order by id, decrementing the aggregate by its current size.
     pub(crate) fn remove(&mut self, oid: Oid) -> Option<O> {
         let removed = self.orders.remove_node(oid);
