@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use itertools::Itertools;
 use price_level::PriceLevel;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 pub(crate) mod levels;
 mod linked_list;
@@ -13,7 +13,9 @@ pub(crate) use types::{Coin, InnerOrder, Oid, Px, PxBand, Side, Sz};
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
-    oid_to_side_px: HashMap<Oid, (Side, Px)>,
+    // FxHashMap: hashed per add/cancel/modify with trusted internal keys -
+    // SipHash's DoS resistance buys nothing here and costs on every op.
+    oid_to_side_px: rustc_hash::FxHashMap<Oid, (Side, Px)>,
     bids: BTreeMap<Px, PriceLevel<O>>,
     asks: BTreeMap<Px, PriceLevel<O>>,
 }
@@ -22,8 +24,17 @@ pub(crate) struct OrderBook<O> {
 pub(crate) struct Snapshot<O>([Vec<O>; 2]);
 
 impl<O: Clone> Snapshot<O> {
+    /// Production paths consume snapshots via `into_inner` (no re-clone);
+    /// tests borrow them for assertions.
+    #[cfg(test)]
     pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
         &self.0
+    }
+
+    /// Consume the snapshot, yielding the owned per-side order vectors. Lets
+    /// an already-owned snapshot be converted without re-cloning every order.
+    pub(crate) fn into_inner(self) -> [Vec<O>; 2] {
+        self.0
     }
 
     pub(crate) fn truncate(&self, n: usize) -> Self {
@@ -59,7 +70,7 @@ impl<O: InnerOrder> Snapshot<O> {
 impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new() }
+        Self { oid_to_side_px: rustc_hash::FxHashMap::default(), bids: BTreeMap::new(), asks: BTreeMap::new() }
     }
 
     /// Number of orders in this orderbook

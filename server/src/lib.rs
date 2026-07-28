@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::significant_drop_tightening))]
 mod listeners;
 pub mod metrics;
 mod order_book;

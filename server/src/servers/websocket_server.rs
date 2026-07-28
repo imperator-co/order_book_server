@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{
-        ActiveL2Params, CoinBbo, InternalMessage, L2FrameCache, L2FrameKey, L2ParamGuard, L2SnapshotParams,
-        OrderBookListener, hl_listen_hft,
+        ActiveL2Params, ActiveSubGuard, ActiveSubs, CoinBbo, InternalMessage, L2FrameCache, L2FrameKey, L2ParamGuard,
+        L2SnapshotParams, OrderBookListener, hl_listen_hft,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
@@ -146,11 +146,13 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         })
     };
 
-    let websocket_opts =
-        yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
+    let websocket_opts = websocket_options(compression_level);
 
     let start_time = Instant::now();
     let listener_for_health = listener.clone();
+
+    // Shared L4 snapshot body cache (GET /l4Book + WS l4Book subscribe).
+    let l4_cache = Arc::new(L4SnapshotCache::new());
 
     let app: Router = Router::new()
         .route(
@@ -161,11 +163,13 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let l2book_heartbeat_ms = config.l2book_heartbeat_ms;
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
                 let listener = listener.clone();
+                let l4_cache = l4_cache.clone();
                 move |ws_upgrade| async move {
                     ws_handler(
                         ws_upgrade,
                         internal_message_tx.clone(),
                         listener.clone(),
+                        l4_cache.clone(),
                         bbo_only,
                         l2book_heartbeat_ms,
                         bbo_heartbeat_ms,
@@ -178,7 +182,8 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             "/l4Book",
             get({
                 let listener = listener.clone();
-                move |query, headers| l4_snapshot_handler(query, headers, listener.clone())
+                let l4_cache = l4_cache.clone();
+                move |query, headers| l4_snapshot_handler(query, headers, listener.clone(), l4_cache.clone())
             }),
         )
         .route(
@@ -224,6 +229,20 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Negotiate permessage-deflate only when a nonzero level is configured.
+/// yawc's `with_compression_level` always enables the extension (level 0
+/// means "stored blocks", not "off"), so an unconditional call runs deflate
+/// per frame PER CONNECTION even at level 0 - fan-out CPU scaling with
+/// subscriber count for zero bandwidth win. `Options::default()` leaves
+/// compression None, declining the extension entirely.
+fn websocket_options(compression_level: u32) -> yawc::Options {
+    if compression_level > 0 {
+        yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level))
+    } else {
+        yawc::Options::default()
+    }
+}
+
 /// `TcpListener` wrapper that sets `TCP_NODELAY` on every accepted socket.
 /// Without it, Nagle's algorithm can delay small frames (BBO updates are a few
 /// hundred bytes) by up to an RTT while an unacked segment is outstanding.
@@ -252,6 +271,7 @@ fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
+    l4_cache: Arc<L4SnapshotCache>,
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
@@ -276,7 +296,8 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, bbo_only, l2book_heartbeat_ms, bbo_heartbeat_ms).await;
+        handle_socket(ws, internal_message_tx, listener, l4_cache, bbo_only, l2book_heartbeat_ms, bbo_heartbeat_ms)
+            .await;
     });
 
     resp.into_response()
@@ -287,6 +308,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
+    l4_cache: Arc<L4SnapshotCache>,
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
@@ -326,6 +348,12 @@ async fn handle_socket(
     // so cleanup is robust to abnormal disconnects.
     let active_l2_params = listener.lock().await.active_l2_params();
     let mut l2_param_guards: HashMap<L2SnapshotParams, L2ParamGuard> = HashMap::new();
+    // Per-family subscription counts (l4/trades/bbo): the listener skips the
+    // per-event grouping+broadcast work for families with zero subscribers.
+    // One guard set per live subscription; dropping the map on disconnect
+    // releases everything, mirroring l2_param_guards.
+    let active_subs = listener.lock().await.active_subs();
+    let mut sub_guards: HashMap<Subscription, Vec<ActiveSubGuard>> = HashMap::new();
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         let _ = send_socket_message(&mut socket, msg).await;
@@ -525,7 +553,7 @@ async fn handle_socket(
                                         alive &= send_socket_message(&mut socket, ServerResponse::Pong).await;
                                     }
                                     _ => {
-                                        alive &= receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), bbo_only, &mut last_l2, &mut last_bbo, &active_l2_params, &mut l2_param_guards).await;
+                                        alive &= receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &l4_cache, bbo_only, &mut last_l2, &mut last_bbo, &active_l2_params, &mut l2_param_guards, &active_subs, &mut sub_guards).await;
                                     }
                                 }
                             }
@@ -558,11 +586,14 @@ async fn receive_client_message(
     client_message: ClientMessage,
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
+    l4_cache: &Arc<L4SnapshotCache>,
     bbo_only: bool,
     last_l2: &mut HashMap<String, L2Entry>,
     last_bbo: &mut HashMap<String, BboEntry>,
     active_l2_params: &ActiveL2Params,
     l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
+    active_subs: &ActiveSubs,
+    sub_guards: &mut HashMap<Subscription, Vec<ActiveSubGuard>>,
 ) -> bool {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -594,6 +625,17 @@ async fn receive_client_message(
                     let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
                     l2_param_guards.entry(params).or_insert_with(|| active_l2_params.acquire(params));
                 }
+                // Count the subscription's broadcast families as live. MUST
+                // happen before handle_immediate_snapshot below: the listener
+                // only groups/broadcasts for counted families, so counting
+                // first guarantees no update falls between the snapshot and
+                // the stream.
+                if inserted {
+                    let guards = active_subs.acquire_for(&subscription);
+                    if !guards.is_empty() {
+                        sub_guards.insert(subscription.clone(), guards);
+                    }
+                }
                 ("", inserted)
             }
             Err(err) => {
@@ -606,6 +648,7 @@ async fn receive_client_message(
             // stream. Without this, a client that sub/unsub-cycles distinct L2 variants on
             // the same coin (or BBO across coins) leaks one entry per cycle until disconnect.
             if removed {
+                sub_guards.remove(&subscription);
                 match &subscription {
                     Subscription::L2Book { coin, n_sig_figs, mantissa, n_levels } => {
                         last_l2.remove(&l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels));
@@ -633,11 +676,12 @@ async fn receive_client_message(
     };
     if success {
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
-            let msg = subscription.handle_immediate_snapshot(listener).await;
+            let msg = subscription.handle_immediate_snapshot(listener, l4_cache).await;
             match msg {
                 Ok(msg) => msg,
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
+                    sub_guards.remove(subscription);
                     return send_socket_message(socket,
                         ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"))).await;
                 }
@@ -648,8 +692,8 @@ async fn receive_client_message(
         if !send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await {
             return false;
         }
-        if let Some(snapshot_msg) = snapshot_msg {
-            return send_socket_message(socket, snapshot_msg).await;
+        if let Some(snapshot_frame) = snapshot_msg {
+            return send_socket_frame(socket, snapshot_frame).await;
         }
         true
     } else {
@@ -842,10 +886,11 @@ impl Subscription {
     async fn handle_immediate_snapshot(
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
-    ) -> Result<Option<ServerResponse>> {
+        l4_cache: &Arc<L4SnapshotCache>,
+    ) -> Result<Option<bytes::Bytes>> {
         if let Self::L4Book { coin } = self {
-            if let Some(snapshot) = compute_l4_book_snapshot(&listener, coin, PxBand::default()).await {
-                return Ok(Some(ServerResponse::L4Book(snapshot)));
+            if let Some(body) = l4_snapshot_body(l4_cache, &listener, coin, PxBand::default()).await? {
+                return Ok(Some(l4_ws_frame(&body)));
             }
             return Err("Snapshot Failed".into());
         }
@@ -853,20 +898,132 @@ impl Subscription {
     }
 }
 
-/// Banded L4 snapshot of one coin, shared by the WS subscribe path and the
-/// one-shot HTTP endpoint. Snapshots ONLY the requested coin (and only the
-/// requested price band) under the listener lock; the `L4Order` conversion
-/// runs after the lock is released. None when the coin has no book.
-async fn compute_l4_book_snapshot(
+/// Wrap a serialized `L4Book` body into the l4Book WS frame. Byte-identical to
+/// `serde_json::to_string(&ServerResponse::L4Book(..))` (guarded by a test),
+/// without re-serializing the MB-scale body.
+fn l4_ws_frame(body: &bytes::Bytes) -> bytes::Bytes {
+    let mut frame = Vec::with_capacity(body.len() + 32);
+    frame.extend_from_slice(br#"{"channel":"l4Book","data":"#);
+    frame.extend_from_slice(body);
+    frame.push(b'}');
+    bytes::Bytes::from(frame)
+}
+
+/// How long a built L4 snapshot body may be re-served. Long enough that a
+/// burst of pollers (or a reconnect storm of l4Book subscribes) shares ONE
+/// under-lock build, short enough that "the book as of NOW" stays honest -
+/// well under the block cadence clients can observe.
+const L4_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(100);
+/// Concurrent under-lock snapshot builds. More than a couple stacked builds
+/// just queue multi-ms lock holds ahead of ingest (the lock is FIFO-fair);
+/// waiters usually wake into a cache hit instead.
+const L4_SNAPSHOT_BUILD_PERMITS: usize = 2;
+/// Cap on distinct cached (coin, band) keys. minPx/maxPx are client-supplied,
+/// so the key space is unbounded - without a cap an adversary could mint keys
+/// faster than the TTL expires them.
+const L4_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 64;
+
+struct L4CacheEntry {
+    built_at: Instant,
+    /// Serialized `L4Book` JSON: the HTTP body, also the WS frame's `data`.
+    body: bytes::Bytes,
+    /// Lazily-built gzip of `body`, shared by every request within the TTL.
+    gzipped: Option<bytes::Bytes>,
+}
+
+/// Short-TTL cache + build limiter for L4 snapshot bodies. Repeat pollers of
+/// GET /l4Book (explicitly a polling API) and l4Book subscribe storms used to
+/// each pay a full banded book clone UNDER the ingest listener lock, plus
+/// their own MB-scale serialization; now at most one build per (coin, band)
+/// per TTL, with at most `L4_SNAPSHOT_BUILD_PERMITS` builds in flight.
+///
+/// A plain `std::sync::Mutex` guards the map deliberately: every access is a
+/// short lookup/insert and never spans an `.await`.
+struct L4SnapshotCache {
+    entries: std::sync::Mutex<HashMap<(String, PxBand), L4CacheEntry>>,
+    build_permits: tokio::sync::Semaphore,
+}
+
+impl L4SnapshotCache {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+            build_permits: tokio::sync::Semaphore::new(L4_SNAPSHOT_BUILD_PERMITS),
+        }
+    }
+
+    /// Fresh cached body (and gzip, if one was built) for `key`.
+    fn get(&self, key: &(String, PxBand)) -> Option<(bytes::Bytes, Option<bytes::Bytes>)> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(key)?;
+        let hit = (entry.built_at.elapsed() < L4_SNAPSHOT_CACHE_TTL).then(|| (entry.body.clone(), entry.gzipped.clone()));
+        drop(entries);
+        hit
+    }
+
+    /// Insert a freshly-built body. Expired entries are swept here (inserts
+    /// are TTL-rate-limited per key, so the sweep is cheap); if the map is
+    /// still at capacity afterwards the body is simply served uncached.
+    fn insert(&self, key: (String, PxBand), body: bytes::Bytes) {
+        if let Ok(mut entries) = self.entries.lock() {
+            if entries.len() >= L4_SNAPSHOT_CACHE_MAX_ENTRIES {
+                entries.retain(|_, e| e.built_at.elapsed() < L4_SNAPSHOT_CACHE_TTL);
+            }
+            if entries.len() < L4_SNAPSHOT_CACHE_MAX_ENTRIES {
+                entries.insert(key, L4CacheEntry { built_at: Instant::now(), body, gzipped: None });
+            }
+        }
+    }
+
+    /// Attach a gzip variant to an existing fresh entry (best-effort: the
+    /// entry may have expired or been evicted while the gzip was running).
+    fn set_gzipped(&self, key: &(String, PxBand), gz: &bytes::Bytes) {
+        if let Ok(mut entries) = self.entries.lock()
+            && let Some(entry) = entries.get_mut(key)
+        {
+            entry.gzipped = Some(gz.clone());
+        }
+    }
+}
+
+/// Serialized L4 snapshot body for one coin+band, built at most once per TTL.
+/// The listener lock is held only for the banded clone inside
+/// `compute_snapshot_for_coin`; the `L4Order` conversion and the MB-scale
+/// serialization run on a blocking thread so they neither hold the lock nor
+/// wedge async runtime workers. `Ok(None)` when the coin has no book.
+async fn l4_snapshot_body(
+    cache: &Arc<L4SnapshotCache>,
     listener: &Arc<Mutex<OrderBookListener>>,
     coin: &str,
     band: PxBand,
-) -> Option<L4Book> {
+) -> Result<Option<bytes::Bytes>> {
+    let key = (coin.to_string(), band);
+    if let Some((body, _)) = cache.get(&key) {
+        return Ok(Some(body));
+    }
+    // Single-flight (approximate): concurrent requesters queue here; whoever
+    // follows the builder through re-checks the cache and hits it.
+    let _permit = cache.build_permits.acquire().await?;
+    if let Some((body, _)) = cache.get(&key) {
+        return Ok(Some(body));
+    }
+
     let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin), band);
-    snapshot.map(|(time, height, coin_snapshot)| {
-        let levels = coin_snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-        L4Book::Snapshot { coin: coin.to_string(), time, height, levels }
+    let Some((time, height, coin_snapshot)) = snapshot else {
+        return Ok(None);
+    };
+    let coin_owned = coin.to_string();
+    let body = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes> {
+        // The snapshot is already owned (cloned under the lock) - consume it
+        // instead of the old `.as_ref().clone()`, which deep-cloned every
+        // order (several heap Strings each) a second time for nothing.
+        let levels = coin_snapshot.into_inner().map(|orders| orders.into_iter().map(L4Order::from).collect());
+        let book = L4Book::Snapshot { coin: coin_owned, time, height, levels };
+        Ok(bytes::Bytes::from(serde_json::to_string(&book)?))
     })
+    .await??;
+    cache.insert(key, body.clone());
+    Ok(Some(body))
 }
 
 /// Query parameters for the one-shot GET /l4Book endpoint.
@@ -887,6 +1044,7 @@ async fn l4_snapshot_handler(
     axum::extract::Query(query): axum::extract::Query<L4SnapshotQuery>,
     headers: axum::http::HeaderMap,
     listener: Arc<Mutex<OrderBookListener>>,
+    l4_cache: Arc<L4SnapshotCache>,
 ) -> axum::response::Response {
     fn json_response(status: axum::http::StatusCode, body: String) -> axum::response::Response {
         axum::response::Response::builder()
@@ -905,39 +1063,59 @@ async fn l4_snapshot_handler(
             );
         }
     };
-    match compute_l4_book_snapshot(&listener, &query.coin, band).await {
-        Some(snapshot) => match serde_json::to_string(&snapshot) {
-            Ok(body) => {
-                // Order JSON compresses ~10x; without this, transfer time
-                // dwarfs the ~10ms build for remote clients pulling MB-scale
-                // snapshots (a $2000 BTC band is ~2.4MB raw, ~250KB gzipped).
-                let accepts_gzip = headers
-                    .get(axum::http::header::ACCEPT_ENCODING)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.contains("gzip"));
-                if accepts_gzip && let Some(gz) = gzip_body(body.as_bytes()) {
-                    return axum::response::Response::builder()
-                        .status(axum::http::StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .header("content-encoding", "gzip")
-                        .body(gz.into())
-                        .unwrap_or_else(|_| axum::response::Response::new(String::new().into()));
-                }
-                json_response(axum::http::StatusCode::OK, body)
+    match l4_snapshot_body(&l4_cache, &listener, &query.coin, band).await {
+        Ok(Some(body)) => {
+            // Order JSON compresses ~10x; without this, transfer time
+            // dwarfs the build for remote clients pulling MB-scale
+            // snapshots (a $2000 BTC band is ~2.4MB raw, ~250KB gzipped).
+            let accepts_gzip = headers
+                .get(axum::http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("gzip"));
+            if accepts_gzip && let Some(gz) = gzipped_l4_body(&l4_cache, (query.coin.clone(), band), body.clone()).await {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .header("content-encoding", "gzip")
+                    .body(gz.into())
+                    .unwrap_or_else(|_| axum::response::Response::new(String::new().into()));
             }
-            Err(err) => {
-                error!("l4Book snapshot serialization error: {err}");
-                json_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"error":"serialization failed"}"#.to_string(),
-                )
-            }
-        },
-        None => json_response(
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(body.into())
+                .unwrap_or_else(|_| axum::response::Response::new(String::new().into()))
+        }
+        Ok(None) => json_response(
             axum::http::StatusCode::NOT_FOUND,
             format!(r#"{{"error":"no order book for coin {}"}}"#, query.coin),
         ),
+        Err(err) => {
+            error!("l4Book snapshot build error: {err}");
+            json_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"snapshot build failed"}"#.to_string(),
+            )
+        }
     }
+}
+
+/// Gzip of a cached L4 body, built once per TTL window and shared: the first
+/// gzip-accepting request compresses on a blocking thread (MB-scale deflate
+/// would stall an async worker) and stores the result on the cache entry;
+/// followers reuse it. None on failure (caller serves the uncompressed body).
+async fn gzipped_l4_body(
+    cache: &Arc<L4SnapshotCache>,
+    key: (String, PxBand),
+    body: bytes::Bytes,
+) -> Option<bytes::Bytes> {
+    if let Some((_, Some(gz))) = cache.get(&key) {
+        return Some(gz);
+    }
+    let gz = tokio::task::spawn_blocking(move || gzip_body(&body)).await.ok()??;
+    let gz = bytes::Bytes::from(gz);
+    cache.set_gzipped(&key, &gz);
+    Some(gz)
 }
 
 /// Gzip at the fastest level: on MB-scale order JSON the ~10x ratio is what
@@ -1007,6 +1185,38 @@ mod tests {
         assert_eq!(l2_cache_key("BTC", Some(5), None, None), l2_cache_key("BTC", Some(5), None, Some(DEFAULT_LEVELS)));
         assert_ne!(l2_cache_key("BTC", Some(5), None, None), l2_cache_key("ETH", Some(5), None, None));
         assert_ne!(l2_cache_key("BTC", Some(5), Some(2), None), l2_cache_key("BTC", Some(5), Some(5), None));
+    }
+
+    #[test]
+    fn test_l4_ws_frame_matches_server_response_serialization() {
+        // The WS l4Book snapshot frame is now assembled by wrapping the cached
+        // body (no re-serialization); it must stay byte-identical to the old
+        // serde_json::to_string(&ServerResponse::L4Book(..)) wire format.
+        let book = L4Book::Snapshot { coin: "BTC".to_string(), time: 1, height: 2, levels: [Vec::new(), Vec::new()] };
+        let body = bytes::Bytes::from(serde_json::to_string(&book).unwrap());
+        let expected = serde_json::to_string(&ServerResponse::L4Book(book)).unwrap();
+        assert_eq!(l4_ws_frame(&body).as_ref(), expected.as_bytes());
+    }
+
+    #[test]
+    fn test_l4_snapshot_cache_ttl_and_cap() {
+        let cache = L4SnapshotCache::new();
+        let key = ("BTC".to_string(), PxBand::default());
+        assert!(cache.get(&key).is_none());
+        cache.insert(key.clone(), bytes::Bytes::from_static(b"{}"));
+        let (body, gz) = cache.get(&key).expect("fresh entry must hit");
+        assert_eq!(body.as_ref(), b"{}");
+        assert!(gz.is_none());
+        // gzip variant is attached to the live entry and shared afterwards.
+        cache.set_gzipped(&key, &bytes::Bytes::from_static(b"gz"));
+        assert!(cache.get(&key).and_then(|(_, gz)| gz).is_some());
+        // The key-count cap holds even when every entry is fresh: over-cap
+        // inserts are dropped (served uncached) instead of growing the map.
+        for i in 0..(2 * L4_SNAPSHOT_CACHE_MAX_ENTRIES) {
+            cache.insert((format!("C{i}"), PxBand::default()), bytes::Bytes::from_static(b"{}"));
+        }
+        let len = cache.entries.lock().unwrap().len();
+        assert!(len <= L4_SNAPSHOT_CACHE_MAX_ENTRIES, "cache must stay capped, got {len}");
     }
 
     #[test]

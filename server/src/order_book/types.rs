@@ -14,7 +14,7 @@ pub(crate) enum Side {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Oid(u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Px(u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -167,8 +167,9 @@ impl Px {
     }
 }
 
-/// Optional inclusive price band for L4 snapshot filtering.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Optional inclusive price band for L4 snapshot filtering. `Hash` because the
+/// parsed band is part of the L4 snapshot cache key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct PxBand {
     pub(crate) min: Option<Px>,
     pub(crate) max: Option<Px>,
