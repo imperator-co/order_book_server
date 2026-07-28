@@ -66,4 +66,9 @@ pub struct ServerConfig {
     /// never trigger a snapshot re-fetch. The book keeps serving live events
     /// through drift and does NOT self-heal until restarted. Off by default.
     pub no_resync: bool,
+    /// Cap on events cached for gapless replay while a snapshot fetch is in
+    /// flight (~0.5-1KB resident each). Must cover a full fetch window at
+    /// peak event rate or every market-hours re-sync overflows into another
+    /// re-sync. 0 = keep the built-in default.
+    pub replay_cache_events: usize,
 }

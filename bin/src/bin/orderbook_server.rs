@@ -116,6 +116,14 @@ struct Args {
     /// worse than a knowingly-incomplete book.
     #[arg(long, default_value = "false")]
     no_resync: bool,
+
+    /// Cap on events cached for gapless replay while a snapshot fetch runs
+    /// (~0.5-1KB resident each; the default 4M bounds the cache at ~2-4GB).
+    /// Size it to cover a full snapshot-fetch window (hl-node dump + load +
+    /// book build, typically 15-60s) at your peak event rate: an overflow
+    /// drops the cache, installs a gapped book, and forces another re-sync.
+    #[arg(long, default_value = "4000000")]
+    replay_cache_events: usize,
 }
 
 /// Start the Prometheus metrics HTTP server
@@ -179,6 +187,7 @@ async fn main() -> Result<()> {
         l2book_heartbeat_ms: args.l2book_heartbeat_ms,
         bbo_heartbeat_ms: args.bbo_heartbeat_ms,
         no_resync: args.no_resync,
+        replay_cache_events: args.replay_cache_events,
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));

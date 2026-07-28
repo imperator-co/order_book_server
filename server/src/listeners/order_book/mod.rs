@@ -42,11 +42,18 @@ const L2_BROADCAST_THROTTLE_MS: u64 = 50;
 /// throttle so a quiet node between block flushes can never starve the L2 feed
 /// for more than ~throttle + tick.
 const L2_FLUSH_TICK_MS: u64 = 10;
-/// Cap on events cached for replay while a snapshot fetch is in flight. A fetch
-/// normally completes in 10-30s (tens of thousands of events); hitting this cap
-/// means something is pathologically wrong, so we drop the cache and schedule
+/// Default cap on events cached for replay while a snapshot fetch is in
+/// flight (tunable via --replay-cache-events). The cache must absorb the
+/// whole fetch window - hl-node dump + snapshot load + off-lock book build -
+/// and US-peak rates in --stream-with-block-info mode exceed 1M events per
+/// window, which made the old 1M cap overflow on every market-hours re-sync:
+/// the cache was dropped, a gapped book installed, and the next fetch hit the
+/// same wall. Each cached single-event batch is roughly 0.5-1KB resident, so
+/// this default bounds the cache at ~2-4GB in the worst case; it costs
+/// nothing when the backlog stays small (the phased install keeps draining
+/// it once the build finishes). Overflow still drops the cache and schedules
 /// another re-sync rather than risk OOM.
-const MAX_CACHED_EVENTS: usize = 1_000_000;
+const MAX_CACHED_EVENTS: usize = 4_000_000;
 
 mod parallel;
 mod state;
@@ -439,10 +446,9 @@ impl OrderBookListener {
             || self.priority_desync_since.is_some_and(|since| since.elapsed() >= FALLBACK_RESYNC_COALESCE)
     }
 
-    /// Shrink the replay-cache cap so overflow behavior is testable without
-    /// constructing a million events.
-    #[cfg(test)]
-    const fn set_cache_event_cap(&mut self, cap: usize) {
+    /// Override the replay-cache event cap (operator tuning via
+    /// --replay-cache-events; tests shrink it to make overflow reachable).
+    pub(crate) const fn set_cache_event_cap(&mut self, cap: usize) {
         self.cache_event_cap = cap;
     }
 
@@ -1437,6 +1443,9 @@ impl Drop for ActiveSubGuard {
 /// 2. Processes OrderDiffs immediately (doesn't wait for OrderStatuses)
 /// 3. Uses process time instead of block time for lowest latency
 pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
+    if config.replay_cache_events > 0 {
+        listener.lock().await.set_cache_event_cap(config.replay_cache_events);
+    }
     let dir = match config.data_dir.clone() {
         Some(d) => d,
         None => dirs::home_dir().ok_or(
