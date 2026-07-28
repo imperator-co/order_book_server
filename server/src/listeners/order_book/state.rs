@@ -24,12 +24,12 @@ pub(super) struct OrderBookState {
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible).
     // Entries carry their insertion time so cleanup can evict by age instead of
     // nuking the whole map (which killed in-flight halves and forced re-syncs).
-    pending_order_statuses: HashMap<Oid, (NodeDataOrderStatus, Instant)>,
+    pending_order_statuses: rustc_hash::FxHashMap<Oid, (NodeDataOrderStatus, Instant)>,
     // Persistent cache of New diffs (sz + optional insertBefore anchor) waiting for their
     // OrderStatuses. This is the other half of bidirectional caching - handles when Diff
     // arrives BEFORE Status. The anchor must survive the cache so a late-pairing priority
     // ALO order still splices into the right queue position.
-    pending_new_diffs: HashMap<Oid, (crate::order_book::types::Sz, Option<Oid>, Instant)>,
+    pending_new_diffs: rustc_hash::FxHashMap<Oid, (crate::order_book::types::Sz, Option<Oid>, Instant)>,
     // insertBefore anchors that were missing from the book (add fell back to the back of
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
@@ -49,8 +49,8 @@ impl OrderBookState {
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
-            pending_order_statuses: HashMap::new(),
-            pending_new_diffs: HashMap::new(),
+            pending_order_statuses: rustc_hash::FxHashMap::default(),
+            pending_new_diffs: rustc_hash::FxHashMap::default(),
             insert_before_fallbacks: 0,
         }
     }
@@ -188,13 +188,13 @@ impl OrderBookState {
                 "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
                 self.pending_order_statuses.len()
             );
-            self.pending_order_statuses = HashMap::new();
+            self.pending_order_statuses = rustc_hash::FxHashMap::default();
             cleared = true;
         }
 
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
             log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
-            self.pending_new_diffs = HashMap::new();
+            self.pending_new_diffs = rustc_hash::FxHashMap::default();
             cleared = true;
         }
 

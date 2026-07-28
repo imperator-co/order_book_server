@@ -48,7 +48,9 @@ pub(crate) struct NodeDataOrderStatus {
 
 impl NodeDataOrderStatus {
     pub(crate) fn is_inserted_into_book(&self) -> bool {
-        (self.status == "open" && !self.order.is_trigger && (self.order.tif != Some("Ioc".to_string())))
+        // as_deref: this runs per order-status event on the apply path; the
+        // old Some("Ioc".to_string()) comparison heap-allocated per call.
+        (self.status == "open" && !self.order.is_trigger && (self.order.tif.as_deref() != Some("Ioc")))
             || (self.order.is_trigger && self.status == "triggered")
     }
 }
