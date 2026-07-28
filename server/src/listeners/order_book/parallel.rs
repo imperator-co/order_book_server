@@ -63,6 +63,14 @@ fn first_block_number(path: &std::path::Path) -> Option<u64> {
 /// limit and OOM the host.
 const MAX_PARTIAL_LINE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Upper bound on bytes read per `on_modify` call. After a consumer stall the
+/// on-disk backlog can be hundreds of MB; the old read-to-EOF materialized all
+/// of it in memory in one shot (plus a full copy when prepending the partial
+/// tail) at the worst possible moment. One chunk per call keeps resident
+/// memory bounded - the 1ms poll loop (and `on_create`'s drain loop) comes
+/// straight back for the remainder.
+const READ_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Wall-clock milliseconds since the unix epoch, for the watcher health
 /// timestamps. (The previous `Instant::now().elapsed()` measured elapsed time
 /// since *now* - always ~0 - making the health values meaningless.)
@@ -80,7 +88,10 @@ struct FileReader {
     // thousands of times per second per watcher thread.
     file: Option<File>,
     file_position: u64,
-    partial_line: String,
+    // Unterminated tail of the last read, awaiting its newline. Raw bytes, not
+    // String: a bounded read can split a multi-byte character at the chunk
+    // boundary, which must not fail the whole read.
+    partial_line: Vec<u8>,
     base_dir: PathBuf, // Base streaming directory to scan for new files
     // Set when buffered data had to be discarded (oversized partial line);
     // drained by take_desynced so the watcher can notify the listener.
@@ -93,7 +104,7 @@ impl FileReader {
             current_path: None,
             file: None,
             file_position: 0,
-            partial_line: String::new(),
+            partial_line: Vec::new(),
             base_dir,
             desynced: false,
         }
@@ -348,35 +359,50 @@ impl FileReader {
                         }
 
                         if file.seek(SeekFrom::Start(self.file_position)).is_ok() {
-                            let mut buf = String::new();
-                            match file.read_to_string(&mut buf) {
+                            // Bounded read (see READ_CHUNK_BYTES): one chunk per
+                            // call so a catch-up backlog never pins itself in
+                            // memory whole; the caller loops right back for more.
+                            let mut buf = Vec::new();
+                            match Read::by_ref(file).take(READ_CHUNK_BYTES).read_to_end(&mut buf) {
                                 Ok(bytes_read) => {
                                     if bytes_read > 0 {
                                         // Update position
                                         self.file_position += bytes_read as u64;
 
                                         // Prepend any partial line from last read
-                                        let full_buf = std::mem::take(&mut self.partial_line) + &buf;
+                                        let mut full_buf = std::mem::take(&mut self.partial_line);
+                                        full_buf.extend_from_slice(&buf);
 
-                                        // Debug logging
-                                        let line_count = full_buf.lines().count();
-                                        let ends_newline = buf.ends_with('\n');
                                         if count % 10_000 == 0 {
+                                            // The line count walks the whole buffer - only
+                                            // pay for it when this debug line actually fires.
                                             log::debug!(
-                                                "on_modify #{}: read {} bytes, {} lines, ends_newline={}",
-                                                count, bytes_read, line_count, ends_newline
+                                                "on_modify #{}: read {} bytes, {} segments, ends_newline={}",
+                                                count,
+                                                bytes_read,
+                                                full_buf.split(|&b| b == b'\n').count(),
+                                                buf.last() == Some(&b'\n')
                                             );
                                         }
 
                                         // Only the unterminated tail may go to `partial_line`.
                                         // A newline-TERMINATED line that fails the JSON shape
-                                        // check is complete-but-corrupt: buffering it (the old
-                                        // behavior) prepended the garbage to the next read and
-                                        // corrupted the following valid line too. Discard it and
-                                        // flag the data loss so the book re-syncs.
-                                        for segment in full_buf.split_inclusive('\n') {
-                                            if segment.ends_with('\n') {
-                                                let line = segment.trim_end();
+                                        // check (or is not valid UTF-8) is complete-but-corrupt:
+                                        // buffering it (the old behavior) prepended the garbage
+                                        // to the next read and corrupted the following valid
+                                        // line too. Discard it and flag the data loss so the
+                                        // book re-syncs.
+                                        for segment in full_buf.split_inclusive(|&b| b == b'\n') {
+                                            if segment.last() == Some(&b'\n') {
+                                                let Ok(text) = std::str::from_utf8(segment) else {
+                                                    error!(
+                                                        "discarding non-UTF-8 terminated line ({} bytes); flagging desync",
+                                                        segment.len()
+                                                    );
+                                                    self.desynced = true;
+                                                    continue;
+                                                };
+                                                let line = text.trim_end();
                                                 if line.is_empty() {
                                                     continue;
                                                 }
@@ -391,7 +417,7 @@ impl FileReader {
                                                 }
                                             } else {
                                                 // Unterminated tail - buffer until the newline arrives.
-                                                self.partial_line = segment.to_string();
+                                                self.partial_line = segment.to_vec();
                                             }
                                         }
 
@@ -820,6 +846,34 @@ mod tests {
     }
 
     #[test]
+    fn test_catchup_backlog_drained_in_bounded_chunks() {
+        // A backlog larger than READ_CHUNK_BYTES must be drained one chunk per
+        // on_modify call (never materialized whole), with the line split at
+        // the chunk boundary surviving via partial_line. The second line is
+        // multi-byte on purpose: the boundary lands mid-character, which the
+        // byte-based buffering must tolerate (a String read would fail).
+        let dir = test_dir("chunked_catchup");
+        let path = dir.join("0");
+        append(&path, "");
+        let mut reader = FileReader::new(dir.clone());
+        reader.start_tracking(&path);
+
+        let ascii = "x".repeat(6 * 1024 * 1024); // even length: boundary is odd within the é-run
+        let multibyte = "é".repeat(2 * 1024 * 1024);
+        append(&path, &format!("{{\"a\":\"{ascii}\"}}\n{{\"b\":\"{multibyte}\"}}\n"));
+
+        let first = reader.on_modify();
+        assert_eq!(first.len(), 1, "first chunk yields only the first complete line");
+        assert!(first[0].starts_with("{\"a\""));
+        let second = reader.on_modify();
+        assert_eq!(second.len(), 1, "the split line completes on the next chunk");
+        assert!(second[0].starts_with("{\"b\"") && second[0].contains('é'));
+        assert!(reader.on_modify().is_empty(), "backlog fully drained");
+        assert!(!reader.take_desynced(), "a chunked catch-up is not data loss");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_partial_line_overflow_sets_desynced() {
         let dir = test_dir("overflow");
         let path = dir.join("0");
@@ -829,10 +883,19 @@ mod tests {
 
         // A single unterminated line larger than the cap must be discarded and
         // flagged as data loss (the listener re-syncs the book on this signal).
+        // It arrives across several bounded READ_CHUNK_BYTES reads; the cap
+        // trips once the buffered partial exceeds MAX_PARTIAL_LINE_BYTES.
         let huge = "{".repeat(MAX_PARTIAL_LINE_BYTES + 2);
         append(&path, &huge);
-        assert!(reader.on_modify().is_empty());
-        assert!(reader.take_desynced(), "discarding buffered data must flag a desync");
+        let mut desynced = false;
+        for _ in 0..8 {
+            assert!(reader.on_modify().is_empty(), "an unterminated line never yields lines");
+            if reader.take_desynced() {
+                desynced = true;
+                break;
+            }
+        }
+        assert!(desynced, "discarding buffered data must flag a desync");
         assert!(!reader.take_desynced(), "the flag is drained by take_desynced");
         std::fs::remove_dir_all(&dir).ok();
     }
