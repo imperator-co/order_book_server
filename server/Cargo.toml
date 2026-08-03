@@ -27,5 +27,10 @@ sonic-rs = "0.3"
 rustc-hash = "2"
 bytes = "1"
 
+[dev-dependencies]
+# test-util enables tokio::test(start_paused) so timeout-path tests (writer
+# wedged on a never-ready sink) run instantly instead of real-time 5s waits.
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [lints]
 workspace = true

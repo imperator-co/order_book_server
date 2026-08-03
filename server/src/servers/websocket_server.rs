@@ -30,6 +30,7 @@ use tokio::{
     sync::{
         Mutex,
         broadcast::{Sender, channel},
+        mpsc,
     },
 };
 use yawc::{FrameView, OpCode, WebSocket};
@@ -324,7 +325,7 @@ fn ws_handler(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     l4_cache: Arc<L4SnapshotCache>,
@@ -348,13 +349,17 @@ async fn handle_socket(
 
     let mut internal_message_rx = internal_message_tx.subscribe();
     BROADCAST_RECEIVERS.set(internal_message_tx.receiver_count() as i64);
-    let is_ready = listener.lock().await.is_ready();
+    // One lock hold for all setup state (previously four separate acquisitions:
+    // during a reconnect storm every new connection queued four times behind
+    // the FIFO-fair listener lock, exactly when it was most contended).
+    let (is_ready, mut universe, active_l2_params, active_subs) = {
+        let listener_state = listener.lock().await;
+        (listener_state.is_ready(), listener_state.universe(), listener_state.active_l2_params(), listener_state.active_subs())
+    };
     let mut manager = SubscriptionManager::default();
-    // Market-filtered universe for subscription validation. Refreshed from
-    // Snapshot broadcasts (Arc-shared, built once in the listener) whenever the
-    // coin set changes - the old code rebuilt the full String set per connection
-    // on every broadcast.
-    let mut universe = listener.lock().await.universe();
+    // `universe` above: market-filtered universe for subscription validation.
+    // Refreshed from Snapshot broadcasts (Arc-shared, built once in the
+    // listener) whenever the coin set changes.
     // Per-(coin,params) cache for L2 dedup + heartbeat resend (key = "<coin>:<n_sig_figs>:<mantissa>")
     let mut last_l2: HashMap<String, L2Entry> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
@@ -365,29 +370,95 @@ async fn handle_socket(
     // Shared L2 variant registry + this connection's refcount guards (one per variant
     // shape it subscribes to). Dropping the map on disconnect releases every guard,
     // so cleanup is robust to abnormal disconnects.
-    let active_l2_params = listener.lock().await.active_l2_params();
     let mut l2_param_guards: HashMap<L2SnapshotParams, L2ParamGuard> = HashMap::new();
     // Per-family subscription counts (l4/trades/bbo): the listener skips the
     // per-event grouping+broadcast work for families with zero subscribers.
     // One guard set per live subscription; dropping the map on disconnect
     // releases everything, mirroring l2_param_guards.
-    let active_subs = listener.lock().await.active_subs();
     let mut sub_guards: HashMap<Subscription, Vec<ActiveSubGuard>> = HashMap::new();
-    if !is_ready {
+
+    // Split the socket into an owned write half (driven by the writer task) and
+    // a read half polled by this session task. Every send enqueues onto a
+    // bounded queue instead of awaiting the TCP write inline, so a slow client
+    // can never keep this task from polling the socket - which is exactly what
+    // used to stop BOTH application pongs (handled here) and protocol pongs
+    // (flushed by yawc only while the socket is polled): one under-window
+    // client made a broadcast iteration take up to 256 x 5s without a single
+    // poll of the read side.
+    let (sink, mut ws_read) = socket.split();
+    let (data_tx, data_rx) = mpsc::channel(OUTBOUND_QUEUE_DEPTH);
+    let (pong_tx, pong_rx) = mpsc::channel(PONG_QUEUE_DEPTH);
+    let outbound = Outbound { data_tx, pong_tx };
+    let mut writer = tokio::spawn(write_task(sink, data_rx, pong_rx));
+
+    if is_ready {
+        run_session(
+            &mut ws_read,
+            &outbound,
+            &mut internal_message_rx,
+            &mut manager,
+            &mut universe,
+            &mut last_l2,
+            &mut last_bbo,
+            &mut user_addrs,
+            &active_l2_params,
+            &mut l2_param_guards,
+            &active_subs,
+            &mut sub_guards,
+            &listener,
+            &l4_cache,
+            bbo_only,
+            l2book_heartbeat_ms,
+            bbo_heartbeat_ms,
+        )
+        .await;
+    } else {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
-        let _ = send_socket_message(&mut socket, msg).await;
-        return;
+        let _unused = outbound.send_message(msg).await;
     }
 
+    // Writer shutdown: dropping the queue senders lets write_task drain what
+    // it already accepted, then exit and run the close handshake. Bound the
+    // drain so a trickle-reading client can't pin the task (and the connection
+    // gauge) open indefinitely.
+    drop(outbound);
+    if tokio::time::timeout(WS_SEND_TIMEOUT, &mut writer).await.is_err() {
+        writer.abort();
+    }
+}
+
+/// A connection's session loop: broadcast fan-out, heartbeats, and inbound
+/// client messages. Returns when the client disconnects, an outbound queue
+/// send fails (writer dead or queue wedged), or the broadcast receiver closes.
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    ws_read: &mut futures_util::stream::SplitStream<WebSocket>,
+    outbound: &Outbound,
+    internal_message_rx: &mut tokio::sync::broadcast::Receiver<Arc<InternalMessage>>,
+    manager: &mut SubscriptionManager,
+    universe: &mut Arc<HashSet<String>>,
+    last_l2: &mut HashMap<String, L2Entry>,
+    last_bbo: &mut HashMap<String, BboEntry>,
+    user_addrs: &mut HashMap<String, alloy::primitives::Address>,
+    active_l2_params: &ActiveL2Params,
+    l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
+    active_subs: &ActiveSubs,
+    sub_guards: &mut HashMap<Subscription, Vec<ActiveSubGuard>>,
+    listener: &Arc<Mutex<OrderBookListener>>,
+    l4_cache: &Arc<L4SnapshotCache>,
+    bbo_only: bool,
+    l2book_heartbeat_ms: u64,
+    bbo_heartbeat_ms: u64,
+) {
     // Optional heartbeat ticker. We tick at min(enabled_heartbeats)/2 (clamped to [50, 500] ms)
     // so each subscription's last-sent timestamp can drift at most half a heartbeat from the configured value.
     let mut heartbeat_ticker = build_heartbeat_ticker(l2book_heartbeat_ms, bbo_heartbeat_ms);
     let l2_hb = if l2book_heartbeat_ms > 0 { Some(Duration::from_millis(l2book_heartbeat_ms)) } else { None };
     let bbo_hb = if bbo_heartbeat_ms > 0 { Some(Duration::from_millis(bbo_heartbeat_ms)) } else { None };
 
-    // `alive` flips to false the moment any `send_socket_message` returns false
-    // (network error or send timeout). The outer loop checks it at every iteration
-    // boundary so a wedged client is dropped instead of looping forever.
+    // `alive` flips to false the moment any outbound send returns false (writer
+    // dead or queue wedged past the timeout). The outer loop checks it at every
+    // iteration boundary so a doomed client is dropped instead of looping.
     let mut alive = true;
     // Set after a broadcast-channel lag: a dropped Snapshot message may have
     // carried dirty coins this connection never saw, so the next Snapshot must
@@ -401,13 +472,13 @@ async fn handle_socket(
                         match msg.as_ref() {
                             InternalMessage::Snapshot{ l2_snapshots, time, dirty, universe: new_universe, l2_frames } => {
                                 if let Some(u) = new_universe {
-                                    universe = Arc::clone(u);
+                                    *universe = Arc::clone(u);
                                 }
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     // Skip BBO subs here - they get fast updates via BboUpdate
                                     if !matches!(sub, Subscription::Bbo { .. }) {
-                                        alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_l2, dirty, force_full_l2, l2_frames, l2_hb.is_some()).await;
+                                        alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full_l2, l2_frames, l2_hb.is_some()).await;
                                     }
                                 }
                                 force_full_l2 = false;
@@ -417,7 +488,7 @@ async fn handle_socket(
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     if let Subscription::Bbo { coin } = sub {
-                                        alive &= send_ws_data_from_bbo(&mut socket, coin, bbos, *time, &mut last_bbo, bbo_hb.is_some()).await;
+                                        alive &= send_ws_data_from_bbo(outbound, coin, bbos, *time, last_bbo, bbo_hb.is_some()).await;
                                     }
                                 }
                             },
@@ -431,7 +502,7 @@ async fn handle_socket(
                                         if let Some(ct) = trades_by_coin.get(coin.as_str()) {
                                             BROADCASTS_TOTAL.with_label_values(&["trades"]).inc();
                                             let frame = ct.frame.get_or_serialize(|| ServerResponse::Trades(Arc::clone(&ct.trades)));
-                                            alive &= send_socket_frame(&mut socket, frame).await;
+                                            alive &= outbound.send_frame(frame).await;
                                         }
                                     }
                                 }
@@ -444,7 +515,7 @@ async fn handle_socket(
                                             if let Some(cd) = diffs_by_coin.get(coin.as_str()) {
                                                 BROADCASTS_TOTAL.with_label_values(&["bookDiffs"]).inc();
                                                 let frame = cd.book_diffs_frame.get_or_serialize(|| ServerResponse::BookDiffs(Arc::clone(&cd.diffs)));
-                                                alive &= send_socket_frame(&mut socket, frame).await;
+                                                alive &= outbound.send_frame(frame).await;
                                             }
                                         }
                                         Subscription::L4Book { coin } => {
@@ -458,7 +529,7 @@ async fn handle_socket(
                                                         book_diffs: Arc::clone(&cd.diffs),
                                                     }))
                                                 });
-                                                alive &= send_socket_frame(&mut socket, frame).await;
+                                                alive &= outbound.send_frame(frame).await;
                                             }
                                         }
                                         _ => {}
@@ -480,11 +551,11 @@ async fn handle_socket(
                                                         book_diffs: Arc::new(Vec::new()),
                                                     }))
                                                 });
-                                                alive &= send_socket_frame(&mut socket, frame).await;
+                                                alive &= outbound.send_frame(frame).await;
                                             }
                                         }
                                         Subscription::OrderUpdates { user } => {
-                                            alive &= send_ws_order_updates(&mut socket, user, *time, *height, statuses_by_coin, &mut user_addrs).await;
+                                            alive &= send_ws_order_updates(outbound, user, *time, *height, statuses_by_coin, user_addrs).await;
                                         }
                                         _ => {}
                                     }
@@ -528,7 +599,7 @@ async fn handle_socket(
                                     entry.last_sent = now;
                                     BROADCASTS_TOTAL.with_label_values(&["l2_heartbeat"]).inc();
                                     let payload = payload.clone();
-                                    alive &= send_socket_message(&mut socket, ServerResponse::L2Book(payload)).await;
+                                    alive &= outbound.send_message(ServerResponse::L2Book(payload)).await;
                                 }
                             }
                         }
@@ -542,7 +613,7 @@ async fn handle_socket(
                                     entry.last_sent = now;
                                     BROADCASTS_TOTAL.with_label_values(&["bbo_heartbeat"]).inc();
                                     let payload = payload.clone();
-                                    alive &= send_socket_message(&mut socket, ServerResponse::Bbo(payload)).await;
+                                    alive &= outbound.send_message(ServerResponse::Bbo(payload)).await;
                                 }
                             }
                         }
@@ -551,7 +622,7 @@ async fn handle_socket(
                 }
             }
 
-            msg = socket.next() => {
+            msg = ws_read.next() => {
                 if let Some(frame) = msg {
                     match frame.opcode {
                         OpCode::Text => {
@@ -569,16 +640,18 @@ async fn handle_socket(
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
                                 match value {
                                     ClientMessage::Ping => {
-                                        alive &= send_socket_message(&mut socket, ServerResponse::Pong).await;
+                                        // Non-blocking priority enqueue: answered even
+                                        // while the data queue is at capacity.
+                                        alive &= outbound.send_pong();
                                     }
                                     _ => {
-                                        alive &= receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &l4_cache, bbo_only, &mut last_l2, &mut last_bbo, &active_l2_params, &mut l2_param_guards, &active_subs, &mut sub_guards).await;
+                                        alive &= receive_client_message(outbound, manager, value, universe.as_ref(), listener.clone(), l4_cache, bbo_only, last_l2, last_bbo, active_l2_params, l2_param_guards, active_subs, sub_guards).await;
                                     }
                                 }
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
-                                alive &= send_socket_message(&mut socket, msg).await;
+                                alive &= outbound.send_message(msg).await;
                             }
                         }
                         OpCode::Close => {
@@ -592,15 +665,21 @@ async fn handle_socket(
                     return;
                 }
             }
+
+            // The writer dropped its queue receivers (send error/timeout).
+            // Without this branch an idle session - no broadcasts, no inbound
+            // traffic - would never notice the dead writer. Cancel-safe.
+            _ = outbound.data_tx.closed() => {
+                break;
+            }
         }
     }
     info!("Dropping connection: socket write failed or timed out");
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn receive_client_message(
-    socket: &mut WebSocket,
+    outbound: &Outbound,
     manager: &mut SubscriptionManager,
     client_message: ClientMessage,
     universe: &HashSet<String>,
@@ -622,14 +701,14 @@ async fn receive_client_message(
     // operator sees a single clear "denied" message in the log instead of "valid
     // subscription" then a rejection.
     if bbo_only && !matches!(&subscription, Subscription::Bbo { .. }) {
-        return send_socket_message(socket, ServerResponse::Error(
+        return outbound.send_message(ServerResponse::Error(
             "BBO-only mode: L2/L4/Trades subscriptions disabled. Only BBO subscriptions allowed.".to_string(),
         )).await;
     }
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
     if !subscription.validate(universe) {
-        return send_socket_message(socket, ServerResponse::Error(format!("Invalid subscription: {sub}"))).await;
+        return outbound.send_message(ServerResponse::Error(format!("Invalid subscription: {sub}"))).await;
     }
 
     let (word, success) = match &client_message {
@@ -658,7 +737,7 @@ async fn receive_client_message(
                 ("", inserted)
             }
             Err(err) => {
-                return send_socket_message(socket, ServerResponse::Error(format!("Rejected subscription: {err}"))).await;
+                return outbound.send_message(ServerResponse::Error(format!("Rejected subscription: {err}"))).await;
             }
         },
         ClientMessage::Unsubscribe { .. } => {
@@ -701,29 +780,29 @@ async fn receive_client_message(
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
                     sub_guards.remove(subscription);
-                    return send_socket_message(socket,
+                    return outbound.send_message(
                         ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"))).await;
                 }
             }
         } else {
             None
         };
-        if !send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await {
+        if !outbound.send_message(ServerResponse::SubscriptionResponse(client_message)).await {
             return false;
         }
         if let Some(snapshot_frame) = snapshot_msg {
-            return send_socket_frame(socket, snapshot_frame).await;
+            return outbound.send_frame(snapshot_frame).await;
         }
         true
     } else {
-        send_socket_message(socket, ServerResponse::Error(format!("Already {word}subscribed: {sub}"))).await
+        outbound.send_message(ServerResponse::Error(format!("Already {word}subscribed: {sub}"))).await
     }
 }
 
 /// Fast BBO broadcast - directly from BBO HashMap without L2 snapshot computation.
 /// Returns false if the socket send failed/timed out (caller must drop the connection).
 async fn send_ws_data_from_bbo(
-    socket: &mut WebSocket,
+    outbound: &Outbound,
     coin: &str,
     bbos: &HashMap<Coin, CoinBbo>,
     time: u64,
@@ -758,68 +837,145 @@ async fn send_ws_data_from_bbo(
             let frame = cb.frame.get_or_serialize(|| ServerResponse::Bbo(render()));
             let payload = store_payload.then(render);
             last_bbo.insert(coin.to_string(), BboEntry { tuple: current, last_sent: Instant::now(), payload });
-            return send_socket_frame(socket, frame).await;
+            return outbound.send_frame(frame).await;
         }
     }
     true
 }
 
 /// Per-send timeout. A slow or hostile client whose TCP receive window stays full
-/// would otherwise block `socket.send(...).await` indefinitely, freezing this
-/// connection's whole `select!` loop and accumulating broadcast lag.
+/// would otherwise block the writer's `sink.send(...).await` indefinitely. Also
+/// bounds how long the session waits for a slot on a full outbound queue.
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Send a `ServerResponse` to the client. Returns `false` when the underlying
-/// socket failed to write (network error or `WS_SEND_TIMEOUT` elapsed). Callers
-/// in the `select!` loop must bail out on `false` so we drop the doomed
-/// connection instead of looping forever on a wedged write.
-async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) -> bool {
-    let payload = match serde_json::to_string(&msg) {
-        Ok(p) => p,
-        Err(err) => {
-            error!("Server response serialization error: {err}");
-            // Serialization failure is our bug, not the client's; keep the connection.
+/// Frames a connection may have queued before the session considers it too
+/// slow. Broadcast frames are refcounted `bytes::Bytes` clones (built once and
+/// shared across connections), so a full queue holds refcounts, not copies.
+/// Combined with `WS_SEND_TIMEOUT` this is the whole slow-client budget: queue
+/// depth plus one timeout - the old inline sends compounded the timeout across
+/// a subscription loop (256 subscriptions x 5s = minutes during which the
+/// session never polled the socket, so pings went unanswered).
+const OUTBOUND_QUEUE_DEPTH: usize = 128;
+/// Dedicated pong lane depth; see [`Outbound::send_pong`].
+const PONG_QUEUE_DEPTH: usize = 8;
+
+/// Pre-serialized `{"channel":"pong"}` frame, so answering a ping allocates
+/// nothing and never serializes (guarded by a test against
+/// `ServerResponse::Pong`'s serde output).
+const PONG_FRAME: &[u8] = br#"{"channel":"pong"}"#;
+
+/// Bounded outbound queues feeding a connection's writer task. All sends from
+/// the session task enqueue here instead of awaiting the TCP write inline, so
+/// a slow client can never keep the session from polling its socket.
+struct Outbound {
+    data_tx: mpsc::Sender<bytes::Bytes>,
+    pong_tx: mpsc::Sender<bytes::Bytes>,
+}
+
+impl Outbound {
+    /// Serialize and enqueue a `ServerResponse`. Returns `false` when the
+    /// connection is doomed (writer gone or queue wedged); callers in the
+    /// session loop must bail out on `false`, mirroring the old direct sends.
+    async fn send_message(&self, msg: ServerResponse) -> bool {
+        let payload = match serde_json::to_string(&msg) {
+            Ok(p) => p,
+            Err(err) => {
+                error!("Server response serialization error: {err}");
+                // Serialization failure is our bug, not the client's; keep the connection.
+                return true;
+            }
+        };
+        self.send_payload(bytes::Bytes::from(payload)).await
+    }
+
+    /// Enqueue a pre-serialized wire frame (built once in/for the listener
+    /// broadcast and shared by every subscribed connection). An empty frame
+    /// means its serialization failed when it was first built (already logged
+    /// there) - skip it and keep the connection, mirroring `send_message`.
+    async fn send_frame(&self, frame: bytes::Bytes) -> bool {
+        if frame.is_empty() {
             return true;
         }
-    };
-    send_socket_payload(socket, bytes::Bytes::from(payload)).await
-}
-
-/// Send a pre-serialized wire frame (built once in/for the listener broadcast
-/// and shared by every subscribed connection). An empty frame means its
-/// serialization failed when it was first built (already logged there) - skip
-/// it and keep the connection, mirroring `send_socket_message`.
-async fn send_socket_frame(socket: &mut WebSocket, frame: bytes::Bytes) -> bool {
-    if frame.is_empty() {
-        return true;
+        self.send_payload(frame).await
     }
-    send_socket_payload(socket, frame).await
-}
 
-async fn send_socket_payload(socket: &mut WebSocket, payload: bytes::Bytes) -> bool {
-    match tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(FrameView::text(payload))).await {
-        Ok(Ok(())) => {
-            MESSAGES_SENT_TOTAL.inc();
-            true
-        }
-        Ok(Err(err)) => {
-            error!("Failed to send: {err}");
-            WS_SEND_ERRORS_TOTAL.inc();
-            false
-        }
-        Err(_) => {
-            error!("Send timeout (>{:?}); dropping slow client", WS_SEND_TIMEOUT);
-            WS_SEND_ERRORS_TOTAL.inc();
-            // Best-effort close handshake. If the close itself times out we just drop.
-            let _unused = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
-            false
+    async fn send_payload(&self, payload: bytes::Bytes) -> bool {
+        match tokio::time::timeout(WS_SEND_TIMEOUT, self.data_tx.send(payload)).await {
+            Ok(Ok(())) => true,
+            // Writer exited; it already logged and counted the send failure.
+            Ok(Err(_)) => false,
+            Err(_) => {
+                error!("Outbound queue full for >{WS_SEND_TIMEOUT:?}; dropping slow client");
+                WS_SEND_ERRORS_TOTAL.inc();
+                false
+            }
         }
     }
+
+    /// Enqueue a pong reply. Synchronous and independent of any data backlog:
+    /// pongs ride a small dedicated lane the writer drains first, so a ping is
+    /// answered even while the data queue is full. A full pong lane means the
+    /// client cannot drain even a handful of tiny control replies - wedged -
+    /// so the connection is dropped.
+    fn send_pong(&self) -> bool {
+        match self.pong_tx.try_send(bytes::Bytes::from_static(PONG_FRAME)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                error!("Pong queue full; dropping wedged client");
+                WS_SEND_ERRORS_TOTAL.inc();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
+/// Writer half of a connection: drains the bounded outbound queues onto the
+/// socket sink, pongs first (`biased`). Generic over the sink for testability.
+/// Exits on a send error/timeout or once both queue senders are dropped, then
+/// attempts a best-effort close handshake (`poll_ready`/`close` also flush
+/// yawc's internally-queued control replies, e.g. protocol-level pongs).
+async fn write_task<S>(mut sink: S, mut data_rx: mpsc::Receiver<bytes::Bytes>, mut pong_rx: mpsc::Receiver<bytes::Bytes>)
+where
+    S: futures_util::Sink<FrameView> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let mut data_open = true;
+    let mut pong_open = true;
+    while data_open || pong_open {
+        let frame = select! {
+            biased;
+
+            pong = pong_rx.recv(), if pong_open => match pong {
+                Some(frame) => frame,
+                None => { pong_open = false; continue; }
+            },
+            data = data_rx.recv(), if data_open => match data {
+                Some(frame) => frame,
+                None => { data_open = false; continue; }
+            },
+        };
+        match tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(FrameView::text(frame))).await {
+            Ok(Ok(())) => MESSAGES_SENT_TOTAL.inc(),
+            Ok(Err(err)) => {
+                error!("Failed to send: {err}");
+                WS_SEND_ERRORS_TOTAL.inc();
+                break;
+            }
+            Err(_) => {
+                error!("Send timeout (>{WS_SEND_TIMEOUT:?}); dropping slow client");
+                WS_SEND_ERRORS_TOTAL.inc();
+                break;
+            }
+        }
+    }
+    // Best-effort close handshake. If the close itself times out we just drop.
+    let _unused = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn send_ws_data_from_snapshot(
-    socket: &mut WebSocket,
+    outbound: &Outbound,
     subscription: &Subscription,
     snapshot: &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
     time: u64,
@@ -882,7 +1038,7 @@ async fn send_ws_data_from_snapshot(
                 Ok(json) => bytes::Bytes::from(json),
                 Err(err) => {
                     error!("Server response serialization error: {err}");
-                    bytes::Bytes::new() // skipped by send_socket_frame
+                    bytes::Bytes::new() // skipped by Outbound::send_frame
                 }
             };
             (hash, frame, l2_book)
@@ -893,7 +1049,7 @@ async fn send_ws_data_from_snapshot(
             BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
             let payload = store_payload.then(|| payload.clone());
             last_l2.insert(key, L2Entry { hash: current_hash, last_sent: Instant::now(), payload });
-            return send_socket_frame(socket, frame.clone()).await;
+            return outbound.send_frame(frame.clone()).await;
         }
         // else: skip, L2 unchanged
     }
@@ -1154,7 +1310,7 @@ fn gzip_body(body: &[u8]) -> Option<Vec<u8>> {
 /// across coins (same block, same time/height) the grouping iterates in map
 /// order.
 async fn send_ws_order_updates(
-    socket: &mut WebSocket,
+    outbound: &Outbound,
     user: &str,
     time: u64,
     height: u64,
@@ -1182,7 +1338,7 @@ async fn send_ws_order_updates(
         .collect();
 
     if !user_updates.is_empty() {
-        return send_socket_message(socket, ServerResponse::OrderUpdates(user_updates)).await;
+        return outbound.send_message(ServerResponse::OrderUpdates(user_updates)).await;
     }
     true
 }
@@ -1190,6 +1346,120 @@ async fn send_ws_order_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    /// Sink that records every sent frame's payload, for driving `write_task`.
+    #[derive(Clone, Default)]
+    struct RecordingSink(Arc<std::sync::Mutex<Vec<bytes::Bytes>>>);
+
+    impl futures_util::Sink<FrameView> for RecordingSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, item: FrameView) -> std::result::Result<(), Self::Error> {
+            self.0.lock().unwrap().push(item.payload.clone());
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Sink that is never ready: models a client whose TCP window stays full.
+    struct StuckSink;
+
+    impl futures_util::Sink<FrameView> for StuckSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _item: FrameView) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn test_pong_frame_matches_server_response_serialization() {
+        // send_pong enqueues the pre-serialized constant; it must stay
+        // byte-identical to the serde wire format of ServerResponse::Pong.
+        assert_eq!(PONG_FRAME, serde_json::to_string(&ServerResponse::Pong).unwrap().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_write_task_sends_pongs_before_queued_data() {
+        // Data enqueued FIRST, pong after - the pong must still go out first:
+        // that ordering is what keeps pings answered under a data backlog.
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (pong_tx, pong_rx) = mpsc::channel(8);
+        for i in 0..3 {
+            data_tx.send(bytes::Bytes::from(format!("data{i}"))).await.unwrap();
+        }
+        pong_tx.send(bytes::Bytes::from_static(PONG_FRAME)).await.unwrap();
+        drop((data_tx, pong_tx));
+
+        let sink = RecordingSink::default();
+        write_task(sink.clone(), data_rx, pong_rx).await;
+
+        let frames = sink.0.lock().unwrap();
+        assert_eq!(frames.len(), 4, "all queued frames must drain before exit");
+        assert_eq!(frames[0].as_ref(), PONG_FRAME, "the pong must jump the data backlog");
+    }
+
+    #[tokio::test]
+    async fn test_outbound_fails_fast_when_writer_is_gone() {
+        // A dead writer (dropped receivers) must fail sends immediately - the
+        // session bails out instead of queueing into the void.
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (pong_tx, pong_rx) = mpsc::channel(8);
+        drop((data_rx, pong_rx));
+        let outbound = Outbound { data_tx, pong_tx };
+        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"x")).await);
+        assert!(!outbound.send_pong());
+        // And the idle-session watchdog branch fires.
+        outbound.data_tx.closed().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_pong_full_lane_means_wedged_client() {
+        let (data_tx, _data_rx) = mpsc::channel(8);
+        let (pong_tx, _pong_rx) = mpsc::channel(2);
+        let outbound = Outbound { data_tx, pong_tx };
+        assert!(outbound.send_pong());
+        assert!(outbound.send_pong());
+        // Lane full and nothing draining: the client is wedged.
+        assert!(!outbound.send_pong());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stuck_writer_times_out_and_dooms_the_session() {
+        // Writer wedged on a never-ready socket: it must give up after
+        // WS_SEND_TIMEOUT, and session sends must then start failing. This
+        // bounds the slow-client budget at queue depth + one timeout - the old
+        // inline sends compounded the timeout per subscription.
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (pong_tx, pong_rx) = mpsc::channel(1);
+        let outbound = Outbound { data_tx, pong_tx };
+        let writer = tokio::spawn(write_task(StuckSink, data_rx, pong_rx));
+
+        assert!(outbound.send_payload(bytes::Bytes::from_static(b"x")).await);
+        writer.await.unwrap();
+        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"y")).await);
+    }
 
     #[test]
     fn test_l2_cache_key_distinguishes_n_levels() {
