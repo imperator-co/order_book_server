@@ -3,8 +3,9 @@ use crate::{
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
         FILE_LINES_PARSED_TOTAL, INSERT_BEFORE_FALLBACK_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE,
-        ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS,
-        PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
+        LAST_EVENT_APPLIED_MS, LISTENER_LOCK_WAIT, ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT,
+        ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
+        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, RESYNC_PHASE_DURATION, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
@@ -67,6 +68,8 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
+        ORDERBOOK_RESYNC_IN_FLIGHT.set(1);
+        let total_start = Instant::now();
         // CRITICAL: Start caching BEFORE generating the snapshot. Every
         // book-affecting batch that arrives while hl-node dumps state is cached,
         // and the install replays the ones above the snapshot height - so the
@@ -97,6 +100,10 @@ fn fetch_snapshot(
             }
             Err(err) => Err(err),
         };
+        let total_elapsed = total_start.elapsed();
+        RESYNC_PHASE_DURATION.with_label_values(&["total"]).observe(total_elapsed.as_secs_f64());
+        info!("Snapshot fetch+install cycle finished in {}ms (ok={})", total_elapsed.as_millis(), res.is_ok());
+        ORDERBOOK_RESYNC_IN_FLIGHT.set(0);
         let _unused = tx.send(res);
         Ok::<(), Error>(())
     });
@@ -138,31 +145,40 @@ async fn install_snapshot_phased(
     snapshot: Snapshots<InnerL4Order>,
     height: u64,
 ) -> Result<()> {
-    install_snapshot_phased_impl(listener, snapshot, height, INSTALL_RESIDUAL_EVENTS_MAX).await
+    install_snapshot_phased_impl(listener, snapshot, height, INSTALL_RESIDUAL_EVENTS_MAX, INSTALL_MAX_CHASE_ROUNDS)
+        .await
 }
 
-/// `residual_events_max` is threaded through so tests can force chase rounds
-/// with small caches; production uses [`INSTALL_RESIDUAL_EVENTS_MAX`].
+/// `residual_events_max` and `max_chase_rounds` are threaded through so tests
+/// can force chase rounds and the non-converging give-up path with small
+/// caches; production uses [`INSTALL_RESIDUAL_EVENTS_MAX`] and
+/// [`INSTALL_MAX_CHASE_ROUNDS`].
 async fn install_snapshot_phased_impl(
     listener: &Arc<Mutex<OrderBookListener>>,
     snapshot: Snapshots<InnerL4Order>,
     height: u64,
     residual_events_max: usize,
+    max_chase_rounds: usize,
 ) -> Result<()> {
     let ignore_spot = listener.lock().await.ignore_spot;
 
     // Phase 1 - build: pure CPU over every coin/order in the market. Run on a
     // blocking thread so it neither holds the listener lock nor wedges a
     // runtime worker that connection tasks need.
+    let build_start = Instant::now();
     let mut new_state =
         tokio::task::spawn_blocking(move || OrderBookState::from_snapshot(snapshot, height, 0, true, ignore_spot))
             .await?;
+    let build_elapsed = build_start.elapsed();
+    RESYNC_PHASE_DURATION.with_label_values(&["build"]).observe(build_elapsed.as_secs_f64());
+    info!("Replacement book built in {}ms", build_elapsed.as_millis());
 
     // Phase 2 - chase the tail: drain what accumulated, replay it off-lock,
     // repeat. Each round's lock hold is only the O(1) cache steal.
+    let chase_start = Instant::now();
     let mut replayed = 0usize;
     let mut replay_failed = false;
-    for _ in 0..INSTALL_MAX_CHASE_ROUNDS {
+    for round in 0..max_chase_rounds {
         let chunk = {
             let mut guard = listener.lock().await;
             let (pending_events, cache_alive) = guard.replay_cache_status();
@@ -173,7 +189,11 @@ async fn install_snapshot_phased_impl(
             // bookkeeping keeps the book marked for re-sync - but the fresh
             // snapshot still supersedes the even-staler live book.
             if !cache_alive || pending_events <= residual_events_max {
+                RESYNC_PHASE_DURATION.with_label_values(&["chase"]).observe(chase_start.elapsed().as_secs_f64());
+                info!("Phased install chase converged after {round} rounds; {replayed} events replayed off-lock");
+                let commit_start = Instant::now();
                 guard.finish_install(new_state, height, replayed, replay_failed);
+                RESYNC_PHASE_DURATION.with_label_values(&["commit"]).observe(commit_start.elapsed().as_secs_f64());
                 return Ok(());
             }
             guard.drain_replay_cache()
@@ -194,8 +214,35 @@ async fn install_snapshot_phased_impl(
         replayed += chunk_replayed;
         replay_failed |= chunk_failed;
     }
-    // Chase cap hit without converging: commit with whatever is still cached.
-    listener.lock().await.finish_install(new_state, height, replayed, replay_failed);
+    // Chase cap hit without converging: replay can't outrun live arrival, so
+    // replaying the remainder under the lock is unbounded (up to the full
+    // cache cap - a potentially minutes-long hold that would stall ingest,
+    // /health, and every connection touching the listener lock). Discard the
+    // remainder instead: commit the fresh-but-gapped book and re-mark it
+    // desynced in the same lock hold, so the damped ticker schedules another
+    // fetch. The fresh snapshot still supersedes the even-staler live book -
+    // the same trade-off the dead-cache commit above already accepts.
+    RESYNC_PHASE_DURATION.with_label_values(&["chase"]).observe(chase_start.elapsed().as_secs_f64());
+    let commit_start = Instant::now();
+    {
+        let mut guard = listener.lock().await;
+        let (pending_events, cache_alive) = guard.replay_cache_status();
+        if cache_alive && pending_events > residual_events_max {
+            let dropped = guard.abandon_replay_cache();
+            log::warn!(
+                "Phased install chase did not converge after {max_chase_rounds} rounds; \
+                 dropping {dropped} cached events and committing gapped book"
+            );
+            guard.finish_install(new_state, height, replayed, replay_failed);
+            // AFTER finish_install: it resets the desync epoch, and the
+            // re-mark must survive into the committed book.
+            guard.mark_desynced("install_chase_overflow");
+        } else {
+            // The backlog drained (or died) between the last round and here.
+            guard.finish_install(new_state, height, replayed, replay_failed);
+        }
+    }
+    RESYNC_PHASE_DURATION.with_label_values(&["commit"]).observe(commit_start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -485,6 +532,16 @@ impl OrderBookListener {
         self.fetched_snapshot_cache.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
+    /// Discard the replay cache without replaying it (chase-cap give-up): the
+    /// caller commits the gapped book and re-marks it desynced in the same
+    /// lock hold. Returns the number of discarded events.
+    fn abandon_replay_cache(&mut self) -> usize {
+        let dropped = self.cached_event_count;
+        self.cached_event_count = 0;
+        self.fetched_snapshot_cache = None;
+        dropped
+    }
+
     /// Commit phase of a snapshot install: replay everything still cached
     /// above `height` onto `new_state`, run the loss/desync bookkeeping,
     /// invalidate the L2 caches, and swap the new book in. Synchronous with
@@ -556,6 +613,11 @@ impl OrderBookListener {
         // Force the next flush to treat the active variant set as "changed" so the
         // empty cache is rebuilt against whatever shapes are currently subscribed.
         self.last_active_l2_params.clear();
+        // Lock-free readiness/staleness signals for /health: seed the last-
+        // applied stamp here so the first probe after an install isn't
+        // reported stale before the next live batch lands.
+        ORDERBOOK_READY.set(1);
+        LAST_EVENT_APPLIED_MS.set(parallel::now_unix_ms() as i64);
         info!("Order book ready at height {height}");
     }
 
@@ -1047,6 +1109,12 @@ impl OrderBookListener {
             HashSet::new()
         };
         EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
+        // Staleness signal for /health: one atomic store per applied batch.
+        // Only the live-apply path advances it - batches consumed by the
+        // replay cache bailed out above, so a not-yet-ready book stays stale.
+        if self.order_book_state.is_some() {
+            LAST_EVENT_APPLIED_MS.set(parallel::now_unix_ms() as i64);
+        }
 
         // Log HFT state progress periodically
         static HFT_STATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1200,19 +1268,11 @@ impl OrderBookListener {
             // Rebuild the shared universe only when the coin set actually changed.
             // Built once here instead of once per connection per broadcast (the
             // old per-connection derivation allocated the full coin-name set for
-            // every connection on every flush).
-            let universe = if coin_set_changed {
-                let market_filter = self.market_filter;
-                Some(Arc::new(
-                    self.l2_snapshot_cache
-                        .keys()
-                        .filter(|coin| coin_in_market_filter(coin, market_filter))
-                        .map(Coin::value)
-                        .collect::<HashSet<String>>(),
-                ))
-            } else {
-                None
-            };
+            // every connection on every flush). Derived from the book state, not
+            // the L2 cache: the cache is a partial universe while a post-install
+            // backfill ramp is in progress (see L2_BACKFILL_COINS_PER_FLUSH),
+            // and subscription validation must not shrink to the ramped subset.
+            let universe = if coin_set_changed { Some(self.universe()) } else { None };
 
             if let Some(tx) = &self.internal_message_tx {
                 let msg = Arc::new(InternalMessage::Snapshot {
@@ -1535,7 +1595,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             // and the tick is only Ready every L2_FLUSH_TICK_MS, so it cannot starve
             // the event arm in return.
             _ = l2_flush_ticker.tick() => {
-                listener.lock().await.flush_l2_if_due();
+                let lock_start = Instant::now();
+                let mut guard = listener.lock().await;
+                LISTENER_LOCK_WAIT.observe(lock_start.elapsed().as_secs_f64());
+                guard.flush_l2_if_due();
             }
 
             // Process events from the file watchers, draining up to
@@ -1579,7 +1642,9 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     }
                 }
                 if !actions.is_empty() {
+                    let lock_start = Instant::now();
                     let mut guard = listener.lock().await;
+                    LISTENER_LOCK_WAIT.observe(lock_start.elapsed().as_secs_f64());
                     for action in actions {
                         match action {
                             Action::Apply(height, batch, source) => guard.apply_event_batch(height, batch, source),
@@ -2049,7 +2114,9 @@ mod tests {
 
         // residual_events_max = 0 forces the cache through at least one
         // off-lock chase round before the commit sees an empty cache.
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 150, 0).await.expect("install");
+        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 150, 0, INSTALL_MAX_CHASE_ROUNDS)
+            .await
+            .expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready());
@@ -2072,7 +2139,9 @@ mod tests {
             assert!(guard.universe().contains("ETH"), "events during a re-sync still apply to the live book");
         }
 
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 15, 0).await.expect("install");
+        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 15, 0, INSTALL_MAX_CHASE_ROUNDS)
+            .await
+            .expect("install");
 
         let guard = listener.lock().await;
         let universe = guard.universe();
@@ -2116,11 +2185,39 @@ mod tests {
             assert!(!cache_alive, "overflow must drop the cache");
         }
 
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 5, 0).await.expect("install");
+        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 5, 0, INSTALL_MAX_CHASE_ROUNDS)
+            .await
+            .expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready(), "the fresh snapshot still supersedes the stale book");
         assert!(guard.needs_resync(), "incomplete replay must keep the book marked");
+    }
+
+    #[tokio::test]
+    async fn test_phased_install_chase_cap_drops_cache_and_stays_marked() {
+        // max_chase_rounds = 0 with a still-alive over-threshold cache models a
+        // chase that never converged: the install must NOT replay the remainder
+        // under the lock (unbounded hold). It commits the gapped-but-fresh book,
+        // discards the cache, and keeps a re-sync scheduled.
+        let (tx, _rx) = tokio::sync::broadcast::channel(32);
+        let listener =
+            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true))));
+        {
+            let mut guard = listener.lock().await;
+            guard.begin_caching();
+            feed_order(&mut guard, "NEW", 1, 200);
+        }
+
+        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 150, 0, 0).await.expect("install");
+
+        let guard = listener.lock().await;
+        assert!(guard.is_ready(), "the fresh snapshot still supersedes the stale book");
+        assert!(!guard.universe().contains("NEW"), "the give-up path must not replay the abandoned cache");
+        assert!(guard.needs_resync(), "dropping cached events must keep the book marked for re-sync");
+        let (pending, cache_alive) = guard.replay_cache_status();
+        assert_eq!(pending, 0, "the abandoned cache must be empty");
+        assert!(!cache_alive, "the abandoned cache must be gone, not just drained");
     }
 
     #[test]

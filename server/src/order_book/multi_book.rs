@@ -147,15 +147,11 @@ impl<O: InnerOrder> OrderBooks<O> {
     }
 }
 
-/// Load snapshots from CLI-generated JSON (without height prefix)
-/// Height is read separately from visor_abci_state.json
-pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
+/// Convert the CLI's parsed `(coin, [bids, asks])` list into typed snapshots.
+fn convert_cli_snapshot<O, R>(snapshot: Vec<(String, [Vec<R>; 2])>, height: u64) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
 {
-    #[allow(clippy::type_complexity)]
-    let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_str(str)?;
     Ok((
         height,
         Snapshots::new(
@@ -171,23 +167,40 @@ where
     ))
 }
 
-/// Load snapshots from CLI-generated JSON file + height from visor state
+/// Load snapshots from CLI-generated JSON file + height from visor state.
+/// Height is read separately from visor_abci_state.json.
 pub(crate) async fn load_snapshots_from_cli_json<O, R>(
     snapshot_path: &Path,
     visor_state_path: &Path,
 ) -> Result<(u64, Snapshots<O>)>
 where
-    O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
+    O: TryFrom<R, Error = Error> + Send + 'static,
+    R: Serialize + for<'a> Deserialize<'a> + Send + 'static,
 {
     // Read height from visor_abci_state.json
     let visor_state = read_to_string(visor_state_path).await?;
     let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
     let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
 
-    // Read snapshot
-    let file_contents = read_to_string(snapshot_path).await?;
-    load_snapshots_from_cli_str(&file_contents, height)
+    // The snapshot file is hundreds of MB; deserialize + convert is seconds of
+    // pure CPU, so it runs on a blocking thread instead of pinning a runtime
+    // worker for the duration. Streaming from the file (instead of reading it
+    // into a String first) keeps one full copy of the file out of peak RSS
+    // while both the old and new books are alive during the install.
+    let snapshot_path = snapshot_path.to_path_buf();
+    let parse_start = std::time::Instant::now();
+    let parsed = tokio::task::spawn_blocking(move || -> Result<(u64, Snapshots<O>)> {
+        let file = fs::File::open(&snapshot_path)?;
+        let reader = std::io::BufReader::with_capacity(1 << 20, file);
+        #[allow(clippy::type_complexity)]
+        let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_reader(reader)?;
+        convert_cli_snapshot(snapshot, height)
+    })
+    .await??;
+    let parse_elapsed = parse_start.elapsed();
+    crate::metrics::RESYNC_PHASE_DURATION.with_label_values(&["parse"]).observe(parse_elapsed.as_secs_f64());
+    log::info!("Snapshot parsed in {}ms", parse_elapsed.as_millis());
+    Ok(parsed)
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
+    metrics::RESYNC_PHASE_DURATION,
     order_book::{Coin, Snapshot, multi_book::OrderBooks, types::InnerOrder},
     prelude::*,
     types::{
@@ -13,6 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Instant,
 };
 use tokio::process::Command;
 
@@ -33,6 +35,10 @@ pub(super) struct SnapshotConfig {
 pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf> {
     info!("Triggering L4 snapshot via hl-node CLI (mode: {:?})...", config.mode);
 
+    // The dump runs on the same host that produces and parses the stream, so
+    // its wall-clock duration is the first thing to check when a re-sync
+    // correlates with a latency incident.
+    let dump_start = Instant::now();
     let output_path = match config.mode {
         SnapshotMode::Docker => {
             // Docker mode: run command inside container
@@ -118,6 +124,10 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
             output_path
         }
     };
+
+    let dump_elapsed = dump_start.elapsed();
+    RESYNC_PHASE_DURATION.with_label_values(&["fetch_dump"]).observe(dump_elapsed.as_secs_f64());
+    info!("hl-node compute-l4-snapshots completed in {}ms (mode: {:?})", dump_elapsed.as_millis(), config.mode);
 
     // Verify file exists
     if output_path.exists() {
@@ -223,6 +233,15 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
 /// Also evicts cache entries for coins no longer present in `order_books`
 /// (e.g. when a coin is delisted and the multi-book removes it). Without
 /// this the cache would grow monotonically with the universe size.
+/// Cap on present-but-uncached coins backfilled per flush. After a snapshot
+/// install (or an active-shape change) clears the cache, the full universe
+/// would otherwise be rebuilt in one rayon burst while the listener lock is
+/// held; the cap spreads that backfill across a few throttle windows.
+/// Uncapped coins are re-detected as uncached and picked up by subsequent
+/// flushes, so convergence is automatic. Dirty coins are never capped: a
+/// coin that actually changed must not be served stale.
+const L2_BACKFILL_COINS_PER_FLUSH: usize = 32;
+
 pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     order_books: &OrderBooks<O>,
     changed_coins: &HashSet<Coin>,
@@ -243,8 +262,13 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     // coins (first-time broadcast after a snapshot reset).
     let mut to_compute: Vec<Coin> =
         changed_coins.iter().filter(|c| order_books.as_ref().contains_key(*c)).cloned().collect();
+    let mut backfilled = 0usize;
     for coin in order_books.as_ref().keys() {
         if !cache.contains_key(coin) && !changed_coins.contains(coin) {
+            if backfilled >= L2_BACKFILL_COINS_PER_FLUSH {
+                break;
+            }
+            backfilled += 1;
             to_compute.push(coin.clone());
         }
     }
@@ -482,6 +506,54 @@ mod tests {
         let (_, recomputed, changed) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
         assert!(changed, "eviction must flag a universe change");
         assert!(recomputed.is_empty());
+    }
+
+    #[test]
+    fn test_backfill_is_capped_per_flush_and_converges() {
+        // Post-install: empty cache, no dirty coins. Each flush must backfill
+        // at most L2_BACKFILL_COINS_PER_FLUSH coins (bounding the under-lock
+        // rayon burst) and repeated flushes must converge to the full universe.
+        let n_coins = 3 * L2_BACKFILL_COINS_PER_FLUSH;
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        for i in 0..n_coins {
+            books.add_order(order(i as u64, &format!("C{i}"), Side::Bid, "1", "100"));
+        }
+
+        let mut cache = HashMap::new();
+        let (_, recomputed, changed) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        assert!(changed, "backfill introduces coins to the cache");
+        assert_eq!(recomputed.len(), L2_BACKFILL_COINS_PER_FLUSH, "backfill must be capped per flush");
+        assert_eq!(cache.len(), L2_BACKFILL_COINS_PER_FLUSH);
+
+        let mut flushes = 1;
+        while cache.len() < n_coins {
+            let (_, recomputed, _) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+            assert!(recomputed.len() <= L2_BACKFILL_COINS_PER_FLUSH);
+            assert!(!recomputed.is_empty(), "the ramp must make progress every flush");
+            flushes += 1;
+        }
+        assert_eq!(flushes, 3, "the ramp must converge in universe/cap flushes");
+        // Converged: nothing left to backfill.
+        let (_, recomputed, _) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        assert!(recomputed.is_empty());
+    }
+
+    #[test]
+    fn test_dirty_coins_are_never_capped() {
+        // Every dirty coin must be rebuilt in the flush that drains it, even if
+        // there are more dirty coins than the backfill cap - the cap only
+        // applies to present-but-uncached (backfill) coins.
+        let n_coins = 2 * L2_BACKFILL_COINS_PER_FLUSH;
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        let mut dirty = HashSet::new();
+        for i in 0..n_coins {
+            books.add_order(order(i as u64, &format!("C{i}"), Side::Bid, "1", "100"));
+            dirty.insert(Coin::new(&format!("C{i}")));
+        }
+
+        let mut cache = HashMap::new();
+        let (_, recomputed, _) = compute_l2_snapshots_incremental(&books, &dirty, &all_params(), &mut cache);
+        assert_eq!(recomputed.len(), n_coins, "dirty coins must all be rebuilt in one flush");
     }
 
     #[test]

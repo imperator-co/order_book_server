@@ -192,6 +192,49 @@ lazy_static! {
         &["coin"]
     ).expect("metric can be created");
 
+    // ==================== RESYNC & LOCK METRICS ====================
+
+    /// Wall-clock duration of each re-sync phase. `fetch_dump` is the hl-node
+    /// CLI dump, `parse` the snapshot JSON deserialize, `build` the replacement
+    /// book construction, `chase` the off-lock replay loop, `commit` the final
+    /// under-lock swap, and `total` the whole fetch-to-install cycle.
+    pub static ref RESYNC_PHASE_DURATION: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("resync_phase_duration_seconds", "Duration of snapshot re-sync phases")
+            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]),
+        &["phase"]
+    ).expect("metric can be created");
+
+    /// Time the ingest loop spends waiting to acquire the listener lock. The
+    /// lock is shared with connection setup and l4Book snapshot builds, so
+    /// sustained waits here mean ingest (and everything queued behind it) is
+    /// being convoyed by other lock holders.
+    pub static ref LISTENER_LOCK_WAIT: Histogram = Histogram::with_opts(
+        HistogramOpts::new("listener_lock_wait_seconds", "Ingest-loop wait to acquire the listener lock")
+            .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0])
+    ).expect("metric can be created");
+
+    /// 1 once the first snapshot install completed and the book is serving.
+    /// Read by /health so the endpoint never has to take the listener lock.
+    pub static ref ORDERBOOK_READY: IntGauge = IntGauge::new(
+        "orderbook_ready",
+        "1 when the order book has installed a snapshot and is serving"
+    ).expect("metric can be created");
+
+    /// Unix epoch ms of the last event batch applied to the live book. /health
+    /// derives a staleness signal from this so consumers can tell "connected
+    /// but not receiving data" apart from a healthy quiet market.
+    pub static ref LAST_EVENT_APPLIED_MS: IntGauge = IntGauge::new(
+        "last_event_applied_ms",
+        "Unix epoch ms of the last event batch applied to the live book"
+    ).expect("metric can be created");
+
+    /// 1 while a snapshot fetch + install cycle is in flight, so stalls can be
+    /// correlated with re-syncs from the metrics alone.
+    pub static ref ORDERBOOK_RESYNC_IN_FLIGHT: IntGauge = IntGauge::new(
+        "orderbook_resync_in_flight",
+        "1 while a snapshot fetch/install cycle is running"
+    ).expect("metric can be created");
+
     // ==================== UPTIME & SYSTEM ====================
 
     /// Server uptime in seconds
@@ -255,6 +298,13 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(ORDERBOOK_ORDERS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_COINS_COUNT.clone())).ok();
     REGISTRY.register(Box::new(BBO_CHANGES_TOTAL.clone())).ok();
+
+    // Resync & lock metrics
+    REGISTRY.register(Box::new(RESYNC_PHASE_DURATION.clone())).ok();
+    REGISTRY.register(Box::new(LISTENER_LOCK_WAIT.clone())).ok();
+    REGISTRY.register(Box::new(ORDERBOOK_READY.clone())).ok();
+    REGISTRY.register(Box::new(LAST_EVENT_APPLIED_MS.clone())).ok();
+    REGISTRY.register(Box::new(ORDERBOOK_RESYNC_IN_FLIGHT.clone())).ok();
 
     // Uptime & system
     REGISTRY.register(Box::new(UPTIME_SECONDS.clone())).ok();

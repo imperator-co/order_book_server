@@ -5,7 +5,8 @@ use crate::{
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
-        MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
+        LAST_EVENT_APPLIED_MS, MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_READY, WS_CONNECTIONS_ACTIVE,
+        WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
     order_book::{Coin, PxBand, Snapshot},
     prelude::*,
@@ -149,7 +150,6 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let websocket_opts = websocket_options(compression_level);
 
     let start_time = Instant::now();
-    let listener_for_health = listener.clone();
 
     // Shared L4 snapshot body cache (GET /l4Book + WS l4Book subscribe).
     let l4_cache = Arc::new(L4SnapshotCache::new());
@@ -188,22 +188,41 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         )
         .route(
             "/health",
-            get(move || {
-                let listener = listener_for_health.clone();
-                async move {
-                    let is_ready = listener.lock().await.is_ready();
-                    let uptime_secs = start_time.elapsed().as_secs();
-                    let height = ORDERBOOK_HEIGHT.get();
-                    let connections = WS_CONNECTIONS_ACTIVE.get();
-                    let body = format!(
-                        r#"{{"status":"{}","uptime_seconds":{},"height":{},"connections":{}}}"#,
-                        if is_ready { "ready" } else { "initializing" },
-                        uptime_secs,
-                        height,
-                        connections,
-                    );
-                    axum::response::Response::builder().header("content-type", "application/json").body(body).unwrap()
-                }
+            get(move || async move {
+                // Lock-free on purpose: this endpoint used to take the listener
+                // lock, so a long ingest hold (resync install, l4Book snapshot
+                // storm) made the node look dead to health checks exactly when
+                // it was busiest - and load balancers then stampeded clients
+                // onto the other node. Reads only atomic gauges now.
+                //
+                // `stale` means the book is installed but no event batch has
+                // been applied recently: subscriptions are acked and the socket
+                // is live, yet clients receive no data. The threshold sits well
+                // above block cadence and normal commit pauses, and well below
+                // the 120s watcher stall alarm.
+                const HEALTH_STALE_AFTER_MS: i64 = 15_000;
+                let is_ready = ORDERBOOK_READY.get() == 1;
+                let last_event_ms = LAST_EVENT_APPLIED_MS.get();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                // -1 = no batch applied yet (also reported while initializing).
+                let age_ms = if last_event_ms > 0 { (now_ms - last_event_ms).max(0) } else { -1 };
+                let status = if !is_ready {
+                    "initializing"
+                } else if age_ms < 0 || age_ms > HEALTH_STALE_AFTER_MS {
+                    "stale"
+                } else {
+                    "ready"
+                };
+                let uptime_secs = start_time.elapsed().as_secs();
+                let height = ORDERBOOK_HEIGHT.get();
+                let connections = WS_CONNECTIONS_ACTIVE.get();
+                let body = format!(
+                    r#"{{"status":"{status}","uptime_seconds":{uptime_secs},"height":{height},"connections":{connections},"last_event_age_ms":{age_ms}}}"#,
+                );
+                axum::response::Response::builder().header("content-type", "application/json").body(body).unwrap()
             }),
         );
 
