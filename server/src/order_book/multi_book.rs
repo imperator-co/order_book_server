@@ -21,6 +21,15 @@ impl<O> Snapshots<O> {
     }
 }
 
+impl<O: InnerOrder> Snapshots<O> {
+    /// Strip the untriggered trigger orders from every coin's snapshot and
+    /// return them flattened. Each trigger order appears twice (once per side)
+    /// — callers dedupe by oid. See [`Snapshot::extract_triggers`].
+    pub(crate) fn extract_triggers(&mut self) -> Vec<O> {
+        self.0.values_mut().flat_map(Snapshot::extract_triggers).collect()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct OrderBooks<O> {
     order_books: BTreeMap<Coin, OrderBook<O>>,

@@ -37,6 +37,13 @@ impl<O: Clone> Snapshot<O> {
         self.0
     }
 
+    /// Raw per-side constructor for tests outside this module (the field is
+    /// private). Production snapshots are built by `convert_cli_snapshot`.
+    #[cfg(test)]
+    pub(crate) const fn from_sides(bids: Vec<O>, asks: Vec<O>) -> Self {
+        Self([bids, asks])
+    }
+
     pub(crate) fn truncate(&self, n: usize) -> Self {
         // Clone only the first n entries per side; the previous full-Vec clone
         // copied up to MAX_LEVELS entries just to drop most of them.
@@ -46,6 +53,14 @@ impl<O: Clone> Snapshot<O> {
 
 impl<O: InnerOrder> Snapshot<O> {
     pub(crate) fn remove_triggers(&mut self) {
+        drop(self.extract_triggers());
+    }
+
+    /// Strips the untriggered trigger orders the hl-node snapshot appends to the
+    /// tail of BOTH sides (same oid in each) and returns the popped copies.
+    /// Callers that keep them should dedupe by oid — every trigger order yields
+    /// two copies, one per side.
+    pub(crate) fn extract_triggers(&mut self) -> Vec<O> {
         #[allow(clippy::unwrap_used)]
         let [bid_oids, ask_oids] = &self
             .0
@@ -54,16 +69,19 @@ impl<O: InnerOrder> Snapshot<O> {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
+        let mut triggers = Vec::new();
         for orders in &mut self.0 {
             while let Some(order) = orders.last() {
                 let oid = order.oid();
                 if bid_oids.contains(&oid) && ask_oids.contains(&oid) {
-                    orders.pop();
+                    #[allow(clippy::unwrap_used)]
+                    triggers.push(orders.pop().unwrap());
                 } else {
                     break;
                 }
             }
         }
+        triggers
     }
 }
 
@@ -421,6 +439,75 @@ mod tests {
         let [b2, a2] = s2.0.map(BTreeSet::from_iter);
         assert_eq!(b1, b2);
         assert_eq!(a1, a2);
+    }
+
+    // ==================== extract_triggers Tests ====================
+
+    #[test]
+    fn test_extract_triggers_pops_tail_duplicates_and_returns_them() {
+        let mut factory = OrderFactory::default();
+        let bid = factory.order(100, 5, Side::Bid); // oid 0, bids only
+        let ask = factory.order(100, 6, Side::Ask); // oid 1, asks only
+        let trig_a = factory.order(50, 7, Side::Bid); // oid 2, appended to BOTH tails
+        let trig_b = factory.order(60, 8, Side::Ask); // oid 3, appended to BOTH tails
+
+        let mut snapshot = Snapshot([
+            vec![bid.clone(), trig_a.clone(), trig_b.clone()],
+            vec![ask.clone(), trig_a.clone(), trig_b.clone()],
+        ]);
+        let extracted = snapshot.extract_triggers();
+
+        // Two copies per trigger order (one per side).
+        let extracted_oids = extracted.iter().map(InnerOrder::oid).collect_vec();
+        assert_eq!(extracted_oids.len(), 4);
+        assert_eq!(extracted_oids.iter().filter(|oid| **oid == Oid::new(2)).count(), 2);
+        assert_eq!(extracted_oids.iter().filter(|oid| **oid == Oid::new(3)).count(), 2);
+
+        // The book orders survive untouched.
+        let [bids, asks] = snapshot.0;
+        assert_eq!(bids, vec![bid]);
+        assert_eq!(asks, vec![ask]);
+    }
+
+    #[test]
+    fn test_extract_triggers_stops_at_first_single_sided_tail_order() {
+        // A book order sitting at the tail (oid on one side only) must stop the
+        // pop loop even if an earlier entry would qualify - only the trailing
+        // trigger block is stripped, matching hl-node's snapshot layout.
+        let mut factory = OrderFactory::default();
+        let trig = factory.order(50, 7, Side::Bid); // oid 0, on both sides
+        let bid_tail = factory.order(100, 5, Side::Bid); // oid 1, bids only, AFTER the trigger
+        let ask = factory.order(100, 6, Side::Ask); // oid 2, asks only
+
+        let mut snapshot = Snapshot([vec![trig.clone(), bid_tail.clone()], vec![ask.clone(), trig.clone()]]);
+        let extracted = snapshot.extract_triggers();
+
+        // Only the ask-side copy is reachable; the bid-side copy is shielded by
+        // bid_tail. (Production snapshots never interleave like this - the
+        // trigger block is strictly trailing - but the guard must not scan past
+        // a non-trigger tail.)
+        assert_eq!(extracted.iter().map(InnerOrder::oid).collect_vec(), vec![Oid::new(0)]);
+        let [bids, _asks] = snapshot.0;
+        assert_eq!(bids, vec![trig, bid_tail]);
+    }
+
+    #[test]
+    fn test_remove_triggers_matches_extract_semantics() {
+        let mut factory = OrderFactory::default();
+        let bid = factory.order(100, 5, Side::Bid);
+        let trig = factory.order(50, 7, Side::Bid);
+
+        let mut removed = Snapshot([vec![bid.clone(), trig.clone()], vec![trig.clone()]]);
+        removed.remove_triggers();
+        let mut extracted = Snapshot([vec![bid.clone(), trig.clone()], vec![trig.clone()]]);
+        drop(extracted.extract_triggers());
+
+        assert_same_book(
+            Snapshot([removed.0[0].clone(), removed.0[1].clone()]),
+            Snapshot([extracted.0[0].clone(), extracted.0[1].clone()]),
+        );
+        assert_eq!(removed.0[0], vec![bid]);
+        assert!(removed.0[1].is_empty());
     }
 
     // ==================== insertBefore (ALO priority) Tests ====================

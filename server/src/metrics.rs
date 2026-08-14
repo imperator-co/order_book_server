@@ -186,6 +186,20 @@ lazy_static! {
         "Number of coins tracked in orderbook"
     ).expect("metric can be created");
 
+    /// Untriggered trigger orders (stops / TP-SL pending their trigger price)
+    pub static ref ORDERBOOK_UNTRIGGERED_TOTAL: IntGauge = IntGauge::new(
+        "orderbook_untriggered_orders_total",
+        "Untriggered trigger orders currently tracked (stops / TP-SL waiting for trigger price)"
+    ).expect("metric can be created");
+
+    /// Untriggered-order evictions by the status string that caused them.
+    /// Today's node vocabulary is all terminal-for-the-oid; a novel status
+    /// showing up here flags a possible wrong eviction after a node upgrade.
+    pub static ref UNTRIGGERED_EVICTIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("orderbook_untriggered_evictions_total", "Untriggered trigger order evictions by causing status"),
+        &["status"]
+    ).expect("metric can be created");
+
     /// BBO changes per coin (top 5 tracked individually)
     pub static ref BBO_CHANGES_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new("bbo_changes_total", "BBO changes by coin"),
@@ -297,6 +311,8 @@ pub fn register_metrics() {
     // Orderbook stats
     REGISTRY.register(Box::new(ORDERBOOK_ORDERS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_COINS_COUNT.clone())).ok();
+    REGISTRY.register(Box::new(ORDERBOOK_UNTRIGGERED_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(UNTRIGGERED_EVICTIONS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(BBO_CHANGES_TOTAL.clone())).ok();
 
     // Resync & lock metrics

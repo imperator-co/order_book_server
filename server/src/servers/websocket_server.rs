@@ -132,6 +132,9 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         let mut listener =
             OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_l2_params.clone(), market_filter);
         listener.set_tolerate_drift(config.no_resync);
+        // BBO-only deployments are sized for a lightweight envelope and have no
+        // consumers for /untriggeredOrders - skip maintaining the side table.
+        listener.set_track_untriggered(!config.bbo_only);
         listener
     };
     let listener = Arc::new(Mutex::new(listener));
@@ -153,7 +156,12 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let start_time = Instant::now();
 
     // Shared L4 snapshot body cache (GET /l4Book + WS l4Book subscribe).
-    let l4_cache = Arc::new(L4SnapshotCache::new());
+    let snapshot_build_permits = Arc::new(tokio::sync::Semaphore::new(L4_SNAPSHOT_BUILD_PERMITS));
+    let l4_cache = Arc::new(L4SnapshotCache::new(snapshot_build_permits.clone()));
+    // Separate cache for GET /untriggeredOrders bodies (distinct key space),
+    // sharing the build permits so the total number of under-lock snapshot
+    // builds queued ahead of ingest stays bounded by L4_SNAPSHOT_BUILD_PERMITS.
+    let untriggered_cache = Arc::new(L4SnapshotCache::new(snapshot_build_permits));
 
     let app: Router = Router::new()
         .route(
@@ -185,6 +193,16 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let listener = listener.clone();
                 let l4_cache = l4_cache.clone();
                 move |query, headers| l4_snapshot_handler(query, headers, listener.clone(), l4_cache.clone())
+            }),
+        )
+        .route(
+            "/untriggeredOrders",
+            get({
+                let listener = listener.clone();
+                let untriggered_cache = untriggered_cache.clone();
+                move |query, headers| {
+                    untriggered_orders_handler(query, headers, listener.clone(), untriggered_cache.clone())
+                }
             }),
         )
         .route(
@@ -1116,15 +1134,16 @@ struct L4CacheEntry {
 /// short lookup/insert and never spans an `.await`.
 struct L4SnapshotCache {
     entries: std::sync::Mutex<HashMap<(String, PxBand), L4CacheEntry>>,
-    build_permits: tokio::sync::Semaphore,
+    // Shared across every cache instance (l4Book + untriggeredOrders): the
+    // permits bound concurrent builds on the ONE listener mutex they all
+    // contend for, so per-instance permits would multiply the worst-case
+    // build queue ahead of ingest.
+    build_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl L4SnapshotCache {
-    fn new() -> Self {
-        Self {
-            entries: std::sync::Mutex::new(HashMap::new()),
-            build_permits: tokio::sync::Semaphore::new(L4_SNAPSHOT_BUILD_PERMITS),
-        }
+    fn new(build_permits: Arc<tokio::sync::Semaphore>) -> Self {
+        Self { entries: std::sync::Mutex::new(HashMap::new()), build_permits }
     }
 
     /// Fresh cached body (and gzip, if one was built) for `key`.
@@ -1303,6 +1322,137 @@ fn gzip_body(body: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
+/// Query parameters for the one-shot GET /untriggeredOrders endpoint.
+#[derive(serde::Deserialize)]
+struct UntriggeredQuery {
+    coin: Option<String>,
+}
+
+/// Wire shape of GET /untriggeredOrders: untriggered trigger orders (stops /
+/// TP-SL waiting for their trigger price) grouped per coin, each order as an
+/// `[ownerAddress, order]` tuple - the same tuple layout as l4Book orders, so
+/// downstream snapshot producers can splice them into `untriggered_orders`
+/// arrays without reshaping.
+#[derive(serde::Serialize)]
+struct UntriggeredOrders {
+    time: u64,
+    height: u64,
+    data: Vec<(String, Vec<(alloy::primitives::Address, L4Order)>)>,
+}
+
+/// Serialized untriggered-orders body (all coins, or one coin), built at most
+/// once per TTL. Same discipline as `l4_snapshot_body`: the listener lock is
+/// held only for the order clone; grouping, conversion, and serialization run
+/// on a blocking thread. `Ok(None)` until the first snapshot install.
+async fn untriggered_body(
+    cache: &Arc<L4SnapshotCache>,
+    listener: &Arc<Mutex<OrderBookListener>>,
+    coin: Option<&str>,
+) -> Result<Option<bytes::Bytes>> {
+    // Reuses the l4 cache's (String, PxBand) key with a default band; ""
+    // (never a valid coin) keys the all-coins body.
+    let key = (coin.unwrap_or_default().to_string(), PxBand::default());
+    if let Some((body, _)) = cache.get(&key) {
+        return Ok(Some(body));
+    }
+    let _permit = cache.build_permits.acquire().await?;
+    if let Some((body, _)) = cache.get(&key) {
+        return Ok(Some(body));
+    }
+
+    let filter_coin = coin.map(Coin::new);
+    let snapshot = listener.lock().await.compute_untriggered_snapshot(filter_coin.as_ref());
+    let Some((time, height, mut orders)) = snapshot else {
+        return Ok(None);
+    };
+    let body = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes> {
+        // Deterministic output (sorted coins, oid-ordered orders) so repeat
+        // polls and side-by-side source diffs compare cleanly. The deep
+        // per-order clone (Arc -> owned L4Order) happens here, off-lock.
+        orders.sort_unstable_by(|a, b| a.coin.cmp(&b.coin).then(a.oid.cmp(&b.oid)));
+        let mut data: Vec<(String, Vec<(alloy::primitives::Address, L4Order)>)> = Vec::new();
+        for inner in orders {
+            let user = inner.user;
+            let coin_name = inner.coin.value();
+            let order = L4Order::from((*inner).clone());
+            match data.last_mut() {
+                Some((current, entries)) if *current == coin_name => entries.push((user, order)),
+                _ => data.push((coin_name, vec![(user, order)])),
+            }
+        }
+        let body = UntriggeredOrders { time, height, data };
+        Ok(bytes::Bytes::from(serde_json::to_string(&body)?))
+    })
+    .await??;
+    cache.insert(key, body.clone());
+    Ok(Some(body))
+}
+
+/// One-shot untriggered trigger orders over plain HTTP. Every request returns
+/// the pending stop / TP-SL set as of NOW - the part of the order state that
+/// never rests on the book and is therefore invisible to l4Book. `coin` is
+/// optional; omitting it returns every coin. A coin with no pending triggers
+/// yields an empty `data` (a legitimate state, not an error); 503 until the
+/// first snapshot install has completed.
+async fn untriggered_orders_handler(
+    axum::extract::Query(query): axum::extract::Query<UntriggeredQuery>,
+    headers: axum::http::HeaderMap,
+    listener: Arc<Mutex<OrderBookListener>>,
+    cache: Arc<L4SnapshotCache>,
+) -> axum::response::Response {
+    fn json_response(status: axum::http::StatusCode, body: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(body.into())
+            .unwrap_or_else(|_| axum::response::Response::new(String::new().into()))
+    }
+
+    // An empty coin param would collide with the all-coins cache key ("" is
+    // the sentinel) and let one client poison the shared all-coins body with
+    // an empty per-coin one - reject it outright.
+    if query.coin.as_deref() == Some("") {
+        return json_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"error":"coin must not be empty; omit the parameter for all coins"}"#.to_string(),
+        );
+    }
+
+    match untriggered_body(&cache, &listener, query.coin.as_deref()).await {
+        Ok(Some(body)) => {
+            let accepts_gzip = headers
+                .get(axum::http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("gzip"));
+            let gzip_key = (query.coin.clone().unwrap_or_default(), PxBand::default());
+            if accepts_gzip && let Some(gz) = gzipped_l4_body(&cache, gzip_key, body.clone()).await {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .header("content-encoding", "gzip")
+                    .body(gz.into())
+                    .unwrap_or_else(|_| axum::response::Response::new(String::new().into()));
+            }
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(body.into())
+                .unwrap_or_else(|_| axum::response::Response::new(String::new().into()))
+        }
+        Ok(None) => json_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"initializing - snapshot not yet installed"}"#.to_string(),
+        ),
+        Err(err) => {
+            error!("untriggeredOrders build error: {err}");
+            json_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"untriggered orders build failed"}"#.to_string(),
+            )
+        }
+    }
+}
+
 /// Send order updates to an OrderUpdates subscriber, filtered by user address.
 /// Filters by reference over the shared per-coin grouping and clones only the
 /// matching statuses - the old path deep-cloned the whole batch per user
@@ -1391,6 +1541,57 @@ mod tests {
         fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[test]
+    fn test_untriggered_orders_wire_shape() {
+        // Consumers splice `data` entries into snapshot-blob `untriggered_orders`
+        // arrays: each order must serialize as an [ownerAddress, order] tuple
+        // with the HL field names (triggerPx / isTrigger / isPositionTpsl ...).
+        // Built through the real InnerL4Order -> L4Order conversion (the path
+        // untriggered_body uses), with an address containing alphabetic hex so
+        // the lowercase (non-EIP-55) serialization is actually pinned.
+        let user: alloy::primitives::Address =
+            "0xAbCdEf0123456789aBcDeF0123456789abcdef01".parse().expect("valid address");
+        let inner = crate::types::inner::InnerL4Order {
+            user,
+            coin: Coin::new("BTC"),
+            side: crate::order_book::Side::Bid,
+            limit_px: crate::order_book::Px::parse_from_str("100.5").unwrap(),
+            sz: crate::order_book::Sz::parse_from_str("1.5").unwrap(),
+            oid: 42,
+            timestamp: 1000,
+            trigger_condition: "Price above 110".to_string(),
+            is_trigger: true,
+            trigger_px: "110.0".to_string(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: "Stop Market".to_string(),
+            tif: None,
+            cloid: None,
+        };
+        let order = L4Order::from(inner);
+        let body = UntriggeredOrders { time: 5, height: 7, data: vec![("BTC".to_string(), vec![(user, order)])] };
+        let json = serde_json::to_string(&body).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["time"], 5);
+        assert_eq!(v["height"], 7);
+        assert_eq!(v["data"][0][0], "BTC");
+        // Tuple layout: [address, order] - address serialized as lowercase hex.
+        assert_eq!(v["data"][0][1][0][0], "0xabcdef0123456789abcdef0123456789abcdef01");
+        let order_json = &v["data"][0][1][0][1];
+        assert_eq!(order_json["triggerPx"], "110.0");
+        assert_eq!(order_json["isTrigger"], true);
+        assert_eq!(order_json["isPositionTpsl"], false);
+        assert_eq!(order_json["side"], "B");
+        assert_eq!(order_json["sz"], "1.5");
+        assert_eq!(order_json["oid"], 42);
+        assert_eq!(order_json["limitPx"], "100.5");
+        // Conversion artifacts the consumer sees: children always [], origSz
+        // mirrors sz (InnerL4Order does not retain the original size).
+        assert_eq!(order_json["children"], serde_json::json!([]));
+        assert_eq!(order_json["origSz"], "1.5");
+        assert_eq!(order_json["user"], "0xabcdef0123456789abcdef0123456789abcdef01");
     }
 
     #[test]
@@ -1489,7 +1690,7 @@ mod tests {
 
     #[test]
     fn test_l4_snapshot_cache_ttl_and_cap() {
-        let cache = L4SnapshotCache::new();
+        let cache = L4SnapshotCache::new(Arc::new(tokio::sync::Semaphore::new(L4_SNAPSHOT_BUILD_PERMITS)));
         let key = ("BTC".to_string(), PxBand::default());
         assert!(cache.get(&key).is_none());
         cache.insert(key.clone(), bytes::Bytes::from_static(b"{}"));

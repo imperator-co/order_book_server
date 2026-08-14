@@ -79,7 +79,13 @@ impl Coin {
 
     /// Returns true for spot markets: @ prefixed coins and PURR/USDC
     pub(crate) fn is_spot(&self) -> bool {
-        self.0.starts_with('@') || self.0 == "PURR/USDC"
+        Self::str_is_spot(&self.0)
+    }
+
+    /// `is_spot` for a plain `&str`, for callers holding a coin name that
+    /// don't want to allocate a `Coin` just to classify it.
+    pub(crate) fn str_is_spot(coin: &str) -> bool {
+        coin.starts_with('@') || coin == "PURR/USDC"
     }
 
     /// Returns true for HIP-3 markets: coins with colon format (X:Y)

@@ -15,6 +15,7 @@ Real-time orderbook data from a local Hyperliquid node:
 - **trades** - Real-time trade feed
 - **bookDiffs** - Raw book diff stream per coin
 - **l4Book** - Full Level 4 orderbook with individual order details (price-banded one-shot reads via `GET /l4Book`)
+- **untriggered orders** - Pending stop / TP-SL trigger orders per coin (one-shot reads via `GET /untriggeredOrders`)
 - **orderUpdates** - User-specific order status stream
 
 ## Quick Start
@@ -280,6 +281,32 @@ The response body is identical to the WS l4Book message's `data` field (`{"Snaps
 
 Send `Accept-Encoding: gzip` (curl: `--compressed`) — order JSON compresses ~6-10x, so wide bands go from MB to hundreds of KB on the wire; without it, transfer time dwarfs the ~10ms server build for remote clients.
 
+### One-shot Untriggered Orders (HTTP)
+Trigger orders (stop-loss / take-profit / stop-market) do **not** rest on the book until their trigger price is crossed, so they are invisible to `l4Book`. The server tracks them separately — bootstrapped from the hl-node snapshot and maintained live from the order-status stream — and serves them over plain HTTP:
+```
+GET /untriggeredOrders            # all coins
+GET /untriggeredOrders?coin=BTC   # one coin
+```
+Response:
+```json
+{
+  "time": 1702530000000,
+  "height": 123456,
+  "data": [
+    ["BTC", [["0x<owner>", { "coin": "BTC", "side": "B", "limitPx": "64100", "sz": "1.25", "oid": 511698638823, "isTrigger": true, "triggerPx": "64000.0", "orderType": "Stop Market", ... }], ...]],
+    ...
+  ]
+}
+```
+`data` is sorted by coin, each order an `[ownerAddress, order]` tuple in the same shape as l4Book orders (`isTrigger: true`, `triggerPx` set). A coin with no pending triggers is simply absent (or `data` is empty) — that is a legitimate state, not an error. Returns `503` until the initial snapshot has been installed. Supports `Accept-Encoding: gzip` like `/l4Book`.
+
+Notes:
+- Entries are evicted on any terminal order status (`canceled`, `triggered`, `filled`, `rejected`, ...); the set is also rebuilt wholesale from the snapshot on every snapshot install. Re-syncs only happen when data loss is detected, so in a healthy steady state the live status stream is the sole source of truth; a phantom entry from a dropped terminal status persists until the next re-sync (or forever under `--no-resync`). Evictions are counted per status in `orderbook_untriggered_evictions_total{status}` — a novel status label after a node upgrade is the signal to re-check the eviction rule.
+- `limitPx` and `sz` are canonicalized through the server's fixed-point types (trailing zeros stripped: `"64100.0"` → `"64100"`); `triggerPx` passes through as the node wrote it and is safe to use as an aggregation key.
+- Position TP/SL orders (`isPositionTpsl: true`, sized to the whole position) carry `sz: "0"` — consumers that drop zero-size rows must special-case them if they need position-attached stops.
+- `children` is always `[]` (the server does not retain child order data, same as l4Book). Child TP/SL orders appear as their own top-level entries once the node emits statuses for them.
+- Disabled in `--bbo-only` mode (the endpoint serves empty `data`) to preserve its lightweight memory envelope. Track the set's size via `orderbook_untriggered_orders_total`.
+
 ### Subscribe to Order Updates (User-Specific)
 Stream raw order status data for a specific user address:
 ```json
@@ -415,6 +442,8 @@ curl http://localhost:9090/metrics
 | **Health** | `orderbook_height` | Current block height |
 | | `orderbook_time_ms` | Orderbook timestamp |
 | | `orderbook_orders_total` | Total orders in the book |
+| | `orderbook_untriggered_orders_total` | Untriggered trigger orders tracked (stops / TP-SL waiting for trigger price) |
+| | `orderbook_untriggered_evictions_total{status}` | Untriggered-order evictions by causing status (a novel label flags a possible wrong eviction) |
 | | `orderbook_coins_count` | Number of coins tracked |
 | | `pending_orders_cache_size` | Pending order statuses in HFT cache |
 | | `pending_diffs_cache_size` | Pending book diffs in HFT cache |
@@ -539,7 +568,7 @@ journalctl -u orderbook-server -f
 
 ## Caveats
 
-- **No untriggered orders** - Only shows orders on the book
+- **Untriggered orders are HTTP-only** - Pending trigger orders are served via `GET /untriggeredOrders` (no WS subscription); the book channels (`bbo`/`l2Book`/`l4Book`) still show resting orders only
 - **Snapshot sync time** - Initial snapshot takes ~10-30 seconds
 - **Direct mode requires a renamed node binary** - hl-node's process detection kills the node if it sees the string `hl-node` in any other process's command line, including this server's snapshot invocations. See [Direct mode and hl-node's process detection](#direct-mode-and-hl-nodes-process-detection)
 

@@ -4,8 +4,9 @@ use crate::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
         FILE_LINES_PARSED_TOTAL, INSERT_BEFORE_FALLBACK_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE,
         LAST_EVENT_APPLIED_MS, LISTENER_LOCK_WAIT, ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT,
-        ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
-        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, RESYNC_PHASE_DURATION, TRADES_UNPAIRED_FILLS_TOTAL,
+        ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT, ORDERBOOK_TIME_MS,
+        ORDERBOOK_UNTRIGGERED_TOTAL, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        RESYNC_PHASE_DURATION, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
@@ -160,15 +161,19 @@ async fn install_snapshot_phased_impl(
     residual_events_max: usize,
     max_chase_rounds: usize,
 ) -> Result<()> {
-    let ignore_spot = listener.lock().await.ignore_spot;
+    let (ignore_spot, track_untriggered) = {
+        let guard = listener.lock().await;
+        (guard.ignore_spot, guard.track_untriggered)
+    };
 
     // Phase 1 - build: pure CPU over every coin/order in the market. Run on a
     // blocking thread so it neither holds the listener lock nor wedges a
     // runtime worker that connection tasks need.
     let build_start = Instant::now();
-    let mut new_state =
-        tokio::task::spawn_blocking(move || OrderBookState::from_snapshot(snapshot, height, 0, true, ignore_spot))
-            .await?;
+    let mut new_state = tokio::task::spawn_blocking(move || {
+        OrderBookState::from_snapshot(snapshot, height, 0, true, ignore_spot, track_untriggered)
+    })
+    .await?;
     let build_elapsed = build_start.elapsed();
     RESYNC_PHASE_DURATION.with_label_values(&["build"]).observe(build_elapsed.as_secs_f64());
     info!("Replacement book built in {}ms", build_elapsed.as_millis());
@@ -307,6 +312,10 @@ pub(crate) struct OrderBookListener {
     // where a continuously-non-converging re-sync loop is worse than a knowingly
     // incomplete book. Drift is NOT self-healed while this is set.
     tolerate_drift: bool,
+    // False in --bbo-only mode: skip maintaining the untriggered trigger-order
+    // side table so the lightweight memory envelope holds. Threaded into every
+    // OrderBookState build.
+    track_untriggered: bool,
     // Upper bound on the height of any unrecovered data loss (0 = none).
     // A snapshot install may only clear needs_resync when the snapshot height
     // covers this bound - a loss that occurred DURING a fetch can sit above the
@@ -372,6 +381,7 @@ impl OrderBookListener {
             priority_desync_since: None,
             recent_fallbacks: 0,
             tolerate_drift: false,
+            track_untriggered: true,
             max_loss_height: 0,
             last_seen_height: 0,
             internal_message_tx,
@@ -401,6 +411,12 @@ impl OrderBookListener {
     /// trigger a re-sync. See `tolerate_drift`.
     pub(crate) fn set_tolerate_drift(&mut self, tolerate: bool) {
         self.tolerate_drift = tolerate;
+    }
+
+    /// Opt out of untriggered trigger-order tracking (--bbo-only): the side
+    /// table stays empty and GET /untriggeredOrders serves empty data.
+    pub(crate) const fn set_track_untriggered(&mut self, track: bool) {
+        self.track_untriggered = track;
     }
 
     pub(crate) const fn is_ready(&self) -> bool {
@@ -511,7 +527,8 @@ impl OrderBookListener {
         // production path instead keeps it serving and pays the RSS overlap).
         self.order_book_state = None;
         self.l2_snapshot_cache = HashMap::new();
-        let new_state = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        let new_state =
+            OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, self.track_untriggered);
         self.finish_install(new_state, height, 0, false);
     }
 
@@ -631,6 +648,17 @@ impl OrderBookListener {
         band: PxBand,
     ) -> Option<(u64, u64, Snapshot<InnerL4Order>)> {
         self.order_book_state.as_ref().and_then(|state| state.compute_snapshot_for_coin(coin, band))
+    }
+
+    /// Untriggered trigger orders - all coins, or one coin when given - as
+    /// (time, height, orders). None until the first snapshot install. Only
+    /// bumps Arc refcounts under the listener lock; callers convert/serialize
+    /// off-lock.
+    pub(crate) fn compute_untriggered_snapshot(
+        &self,
+        coin: Option<&Coin>,
+    ) -> Option<(u64, u64, Vec<std::sync::Arc<InnerL4Order>>)> {
+        self.order_book_state.as_ref().map(|state| state.untriggered_snapshot(coin))
     }
 }
 
@@ -1130,6 +1158,7 @@ impl OrderBookListener {
                 // Record orderbook stats
                 ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
                 ORDERBOOK_COINS_COUNT.set(state.coin_count() as i64);
+                ORDERBOOK_UNTRIGGERED_TOTAL.set(state.untriggered_count() as i64);
 
                 // Cleanup stale pending entries to prevent unbounded memory growth.
                 // A force-clear may evict genuinely in-flight order halves, so it

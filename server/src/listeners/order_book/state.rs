@@ -34,16 +34,56 @@ pub(super) struct OrderBookState {
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
     insert_before_fallbacks: u64,
+    // Untriggered trigger orders (stop / TP-SL waiting for triggerPx to be crossed),
+    // keyed per coin so single-coin queries and bogus-coin probes never scan the
+    // whole set. These never rest on the book: the hl-node snapshot appends them to
+    // both sides (extracted at install), and live "open" statuses with is_trigger
+    // carry them. Removed on any non-"open" status for the oid (canceled /
+    // triggered / filled / rejected / ...). Orders are Arc'd so the endpoint's
+    // under-lock snapshot is a refcount bump per order, not a deep String clone.
+    // Replaced wholesale on every re-sync along with the book, so a missed
+    // terminal status self-heals at the next snapshot install.
+    untriggered_orders: rustc_hash::FxHashMap<Coin, rustc_hash::FxHashMap<Oid, std::sync::Arc<InnerL4Order>>>,
+    // False in --bbo-only mode: the map stays empty there so the documented
+    // lightweight memory envelope holds (the endpoint has no consumers in a
+    // BBO-only deployment anyway).
+    track_untriggered: bool,
 }
 
 impl OrderBookState {
     pub(super) fn from_snapshot(
-        snapshot: Snapshots<InnerL4Order>,
+        mut snapshot: Snapshots<InnerL4Order>,
         height: u64,
         time: u64,
         ignore_triggers: bool,
         ignore_spot: bool,
+        track_untriggered: bool,
     ) -> Self {
+        // When triggers are excluded from the book (production), keep them in the
+        // side table instead of dropping them. The oid insert dedupes the two
+        // per-side copies the node snapshot emits for each trigger order.
+        let mut untriggered_orders: rustc_hash::FxHashMap<
+            Coin,
+            rustc_hash::FxHashMap<Oid, std::sync::Arc<InnerL4Order>>,
+        > = rustc_hash::FxHashMap::default();
+        if ignore_triggers && track_untriggered {
+            for order in snapshot.extract_triggers() {
+                if ignore_spot && order.coin.is_spot() {
+                    continue;
+                }
+                let oid = order.oid();
+                let arc = std::sync::Arc::new(order);
+                if let Some(prev) =
+                    untriggered_orders.entry(arc.coin.clone()).or_default().insert(oid.clone(), arc.clone())
+                    && *prev != *arc
+                {
+                    // The node emits one copy per side; they are expected to be
+                    // identical. A mismatch means the dedupe silently picked one
+                    // of two different views - surface it.
+                    log::warn!("Trigger order snapshot copies differ across sides: oid={oid:?}");
+                }
+            }
+        }
         Self {
             ignore_spot,
             time,
@@ -52,6 +92,8 @@ impl OrderBookState {
             pending_order_statuses: rustc_hash::FxHashMap::default(),
             pending_new_diffs: rustc_hash::FxHashMap::default(),
             insert_before_fallbacks: 0,
+            untriggered_orders,
+            track_untriggered,
         }
     }
 
@@ -128,6 +170,24 @@ impl OrderBookState {
     /// Total number of orders currently in the orderbook
     pub(super) fn order_count(&self) -> usize {
         self.order_book.order_count()
+    }
+
+    /// Count of untriggered trigger orders in the side table
+    pub(super) fn untriggered_count(&self) -> usize {
+        self.untriggered_orders.values().map(rustc_hash::FxHashMap::len).sum()
+    }
+
+    /// Untriggered trigger orders - all coins, or one coin's when `coin` is
+    /// given - along with (time, height). Runs under the listener lock, but
+    /// only bumps an Arc refcount per order (no deep clone); an unknown coin
+    /// is an O(1) map miss. Callers convert/serialize off-lock (same
+    /// discipline as l4Book).
+    pub(super) fn untriggered_snapshot(&self, coin: Option<&Coin>) -> (u64, u64, Vec<std::sync::Arc<InnerL4Order>>) {
+        let orders = match coin {
+            Some(c) => self.untriggered_orders.get(c).map(|m| m.values().cloned().collect()).unwrap_or_default(),
+            None => self.untriggered_orders.values().flat_map(|m| m.values().cloned()).collect(),
+        };
+        (self.time, self.height, orders)
     }
 
     /// Number of coins tracked in the orderbook
@@ -242,6 +302,46 @@ impl OrderBookState {
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
 
+            // Maintain the untriggered-orders side table. "open" + is_trigger is a
+            // pending trigger order (never rests on the book); any other status is
+            // terminal for the untriggered phase (canceled / triggered / filled /
+            // rejected / ...) and evicts the oid. The eviction probe is two hash
+            // lookups (coin via Borrow<str>, then oid) with no allocation - cheap
+            // enough for the hot path.
+            if !self.track_untriggered {
+                // gated off (--bbo-only): the map stays empty
+            } else if order_status.status == "open" {
+                if order_status.order.is_trigger && !(self.ignore_spot && Coin::str_is_spot(&order_status.order.coin)) {
+                    match InnerL4Order::try_from((order_status.user, order_status.order.clone())) {
+                        Ok(inner) => {
+                            self.untriggered_orders
+                                .entry(inner.coin.clone())
+                                .or_default()
+                                .insert(oid.clone(), std::sync::Arc::new(inner));
+                        }
+                        Err(err) => {
+                            // The endpoint under-reports this oid until the next
+                            // re-sync; count it so the gap is visible in metrics,
+                            // not just a log line.
+                            crate::metrics::PARSE_ERRORS_TOTAL.with_label_values(&["untriggered"]).inc();
+                            log::warn!("Skipping unparseable untriggered trigger order oid={oid:?}: {err}");
+                        }
+                    }
+                }
+            } else if let Some(coin_orders) = self.untriggered_orders.get_mut(order_status.order.coin.as_str())
+                && coin_orders.remove(&oid).is_some()
+            {
+                // Labeled by status so a future non-terminal status string that
+                // starts wrongly evicting live triggers shows up in Prometheus
+                // immediately (today's vocabulary is all terminal-for-the-oid).
+                crate::metrics::UNTRIGGERED_EVICTIONS_TOTAL.with_label_values(&[&order_status.status]).inc();
+                if coin_orders.is_empty() {
+                    // Drop the per-coin map once empty so delisted coins don't
+                    // accumulate empty buckets forever.
+                    self.untriggered_orders.remove(order_status.order.coin.as_str());
+                }
+            }
+
             // Check if there's a pending New diff for this order
             if let Some((sz, insert_before, _)) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
@@ -353,7 +453,7 @@ mod tests {
 
     fn empty_state() -> OrderBookState {
         let snapshots = Snapshots::new(HashMap::new());
-        OrderBookState::from_snapshot(snapshots, 0, 0, true, false)
+        OrderBookState::from_snapshot(snapshots, 0, 0, true, false, true)
     }
 
     fn make_l4_order(coin: &str, oid: u64) -> L4Order {
@@ -428,6 +528,196 @@ mod tests {
         assert_eq!(state.coin_count(), 0);
         assert_eq!(state.pending_order_statuses_count(), 0);
         assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    // ==================== Untriggered Trigger Orders ====================
+
+    fn make_inner_order(coin: &str, oid: u64, is_trigger: bool) -> InnerL4Order {
+        InnerL4Order {
+            user: Address::new([1; 20]),
+            coin: Coin::new(coin),
+            side: crate::order_book::types::Side::Bid,
+            limit_px: crate::order_book::Px::new(100_000_000),
+            sz: crate::order_book::Sz::new(100_000_000),
+            oid,
+            timestamp: 1000,
+            trigger_condition: if is_trigger { "Price above 110".to_string() } else { "N/A".to_string() },
+            is_trigger,
+            trigger_px: if is_trigger { "110.0".to_string() } else { "0.0".to_string() },
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: if is_trigger { "Stop Market".to_string() } else { "Limit".to_string() },
+            tif: None,
+            cloid: None,
+        }
+    }
+
+    fn make_trigger_status(coin: &str, oid: u64, status: &str, trigger_px: &str) -> NodeDataOrderStatus {
+        let mut order = make_l4_order(coin, oid);
+        order.is_trigger = true;
+        order.trigger_px = trigger_px.to_string();
+        order.trigger_condition = format!("Price above {trigger_px}");
+        order.order_type = "Stop Market".to_string();
+        NodeDataOrderStatus {
+            time: NaiveDateTime::parse_from_str("2024-01-15 10:30:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+            user: Address::new([2; 20]),
+            hash: Some("0xdef".to_string()),
+            builder: None,
+            status: status.to_string(),
+            order,
+        }
+    }
+
+    /// Snapshots in the hl-node CLI layout: trigger orders appended to the TAIL
+    /// of BOTH sides (same oid in each), after the resting book orders.
+    fn snapshot_with_triggers(coin: &str, resting_oids: &[u64], trigger_oids: &[u64]) -> Snapshots<InnerL4Order> {
+        let mut bids: Vec<InnerL4Order> = resting_oids.iter().map(|&oid| make_inner_order(coin, oid, false)).collect();
+        let mut asks: Vec<InnerL4Order> = Vec::new();
+        for &oid in trigger_oids {
+            bids.push(make_inner_order(coin, oid, true));
+            asks.push(make_inner_order(coin, oid, true));
+        }
+        let snapshot = Snapshot::from_sides(bids, asks);
+        Snapshots::new(std::iter::once((Coin::new(coin), snapshot)).collect())
+    }
+
+    #[test]
+    fn test_from_snapshot_extracts_untriggered_triggers() {
+        let snapshots = snapshot_with_triggers("BTC", &[1, 2], &[100, 101]);
+        let state = OrderBookState::from_snapshot(snapshots, 0, 0, true, false, true);
+        // Triggers are kept in the side table (deduped from the two per-side
+        // copies), not dropped - and never enter the book.
+        assert_eq!(state.untriggered_count(), 2);
+        assert_eq!(state.order_count(), 2);
+        let (_, _, orders) = state.untriggered_snapshot(None);
+        let mut oids: Vec<u64> = orders.iter().map(|o| o.oid).collect();
+        oids.sort_unstable();
+        assert_eq!(oids, vec![100, 101]);
+        assert!(orders.iter().all(|o| o.is_trigger));
+    }
+
+    #[test]
+    fn test_from_snapshot_ignore_triggers_false_keeps_old_semantics() {
+        // Tests that opt out of trigger extraction must not populate the table.
+        let snapshots = snapshot_with_triggers("BTC", &[1], &[]);
+        let state = OrderBookState::from_snapshot(snapshots, 0, 0, false, false, true);
+        assert_eq!(state.untriggered_count(), 0);
+    }
+
+    #[test]
+    fn test_open_trigger_status_upserts_untriggered() {
+        let mut state = empty_state();
+        let status = make_trigger_status("BTC", 500, "open", "110.0");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.untriggered_count(), 1);
+        // It never rests on the book and is NOT cached for diff pairing
+        // (is_inserted_into_book is false for open triggers).
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+
+        // A later "open" for the same oid (modify) replaces the entry.
+        let status = make_trigger_status("BTC", 500, "open", "115.0");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.untriggered_count(), 1);
+        let (_, _, orders) = state.untriggered_snapshot(None);
+        assert_eq!(orders[0].trigger_px, "115.0");
+    }
+
+    #[test]
+    fn test_canceled_trigger_status_removes_untriggered() {
+        let mut state = empty_state();
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_trigger_status("BTC", 500, "open", "110.0")]))
+            .unwrap();
+        assert_eq!(state.untriggered_count(), 1);
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_trigger_status("BTC", 500, "canceled", "110.0")]))
+            .unwrap();
+        assert_eq!(state.untriggered_count(), 0);
+    }
+
+    #[test]
+    fn test_triggered_status_moves_order_from_untriggered_to_book() {
+        let mut state = empty_state();
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_trigger_status("BTC", 500, "open", "110.0")]))
+            .unwrap();
+        assert_eq!(state.untriggered_count(), 1);
+
+        // Trigger fires: "triggered" status pairs with a New diff and the order
+        // rests on the book; the untriggered entry must be evicted.
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_trigger_status("BTC", 500, "triggered", "110.0")]))
+            .unwrap();
+        let diff = make_order_diff("BTC", 500, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        assert_eq!(state.untriggered_count(), 0);
+        assert_eq!(state.order_count(), 1);
+    }
+
+    #[test]
+    fn test_non_trigger_statuses_leave_untriggered_untouched() {
+        let mut state = empty_state();
+        add_resting_order(&mut state, "BTC", 42);
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 42, "filled")])).unwrap();
+        assert_eq!(state.untriggered_count(), 0);
+        assert_eq!(state.order_count(), 1);
+    }
+
+    #[test]
+    fn test_spot_triggers_skipped_when_ignore_spot() {
+        // Live path: spot trigger opens are not tracked under ignore_spot,
+        // matching the diff path's spot filtering.
+        let mut state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, true, true);
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![
+                make_trigger_status("@1", 1, "open", "1.0"),
+                make_trigger_status("PURR/USDC", 2, "open", "1.0"),
+                make_trigger_status("BTC", 3, "open", "110.0"),
+            ]))
+            .unwrap();
+        assert_eq!(state.untriggered_count(), 1);
+        let (_, _, orders) = state.untriggered_snapshot(None);
+        assert_eq!(orders[0].coin, Coin::new("BTC"));
+
+        // Snapshot path: spot triggers are likewise dropped at install.
+        let spot_state =
+            OrderBookState::from_snapshot(snapshot_with_triggers("@1", &[1], &[100]), 0, 0, true, true, true);
+        assert_eq!(spot_state.untriggered_count(), 0);
+    }
+
+    #[test]
+    fn test_untriggered_tracking_gated_off() {
+        // --bbo-only: neither the snapshot extraction nor live statuses populate
+        // the table (the book still strips triggers), so the lightweight memory
+        // envelope holds.
+        let mut state =
+            OrderBookState::from_snapshot(snapshot_with_triggers("BTC", &[1], &[100]), 0, 0, true, false, false);
+        assert_eq!(state.untriggered_count(), 0);
+        assert_eq!(state.order_count(), 1, "book triggers must still be stripped when tracking is off");
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![make_trigger_status("BTC", 500, "open", "110.0")]))
+            .unwrap();
+        assert_eq!(state.untriggered_count(), 0);
+    }
+
+    #[test]
+    fn test_untriggered_snapshot_coin_filter() {
+        let mut state = empty_state();
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![
+                make_trigger_status("BTC", 1, "open", "110.0"),
+                make_trigger_status("ETH", 2, "open", "110.0"),
+                make_trigger_status("ETH", 3, "open", "110.0"),
+            ]))
+            .unwrap();
+        let (_, _, all) = state.untriggered_snapshot(None);
+        assert_eq!(all.len(), 3);
+        let (_, _, eth) = state.untriggered_snapshot(Some(&Coin::new("ETH")));
+        assert_eq!(eth.len(), 2);
+        assert!(eth.iter().all(|o| o.coin == Coin::new("ETH")));
+        let (_, _, none) = state.untriggered_snapshot(Some(&Coin::new("SOL")));
+        assert!(none.is_empty());
     }
 
     // ==================== Bidirectional Cache: Status First ====================
@@ -604,7 +894,7 @@ mod tests {
     #[test]
     fn test_spot_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true); // ignore_spot=true
+        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true, true); // ignore_spot=true
 
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
