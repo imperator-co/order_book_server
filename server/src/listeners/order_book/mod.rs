@@ -178,6 +178,17 @@ async fn install_snapshot_phased_impl(
     RESYNC_PHASE_DURATION.with_label_values(&["build"]).observe(build_elapsed.as_secs_f64());
     info!("Replacement book built in {}ms", build_elapsed.as_millis());
 
+    // Seed the untriggered table from the live state when the snapshot yielded
+    // none (current hl-node dumps carry no trigger orders - a bare rebuild
+    // would wipe everything accumulated since startup). Runs BEFORE the chase
+    // replay so evictions cached during the fetch window apply on top.
+    {
+        let guard = listener.lock().await;
+        if let Some(old_state) = guard.order_book_state.as_ref() {
+            new_state.carry_forward_untriggered(old_state);
+        }
+    }
+
     // Phase 2 - chase the tail: drain what accumulated, replay it off-lock,
     // repeat. Each round's lock hold is only the O(1) cache steal.
     let chase_start = Instant::now();
@@ -523,12 +534,17 @@ impl OrderBookListener {
     #[cfg(test)]
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {height}");
+        let mut new_state =
+            OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, self.track_untriggered);
+        // Mirror the production carry-forward (install_snapshot_phased_impl):
+        // a snapshot with no triggers must not wipe the accumulated table.
+        if let Some(old_state) = self.order_book_state.as_ref() {
+            new_state.carry_forward_untriggered(old_state);
+        }
         // Free the outgoing book before building its replacement (the phased
         // production path instead keeps it serving and pays the RSS overlap).
         self.order_book_state = None;
         self.l2_snapshot_cache = HashMap::new();
-        let new_state =
-            OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, self.track_untriggered);
         self.finish_install(new_state, height, 0, false);
     }
 
@@ -1927,6 +1943,106 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    /// Status batch for an untriggered trigger order ("open" + isTrigger).
+    fn make_trigger_status_batch(coin: &str, oid: u64, height: u64) -> Batch<NodeDataOrderStatus> {
+        let mut order = make_l4_order_json(coin, oid);
+        order["isTrigger"] = serde_json::json!(true);
+        order["triggerPx"] = serde_json::json!("110.0");
+        order["orderType"] = serde_json::json!("Stop Market");
+        serde_json::from_value(serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": height,
+            "events": [{
+                "time": "2024-01-15T10:30:00.000000000",
+                "user": "0x0000000000000000000000000000000000000000",
+                "hash": "0xabc",
+                "status": "open",
+                "order": order,
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_install_carries_untriggered_forward_when_snapshot_is_barren() {
+        // Current hl-node dumps contain no trigger orders; a re-sync must not
+        // wipe the live-accumulated untriggered table.
+        let (mut listener, _rx) = ready_listener();
+        listener.apply_event_batch(
+            10,
+            EventBatch::Orders(make_trigger_status_batch("BTC", 77, 10)),
+            EventSource::OrderStatuses,
+        );
+        assert_eq!(listener.compute_untriggered_snapshot(None).unwrap().2.len(), 1);
+
+        // Barren snapshot (book order only, no triggers) at a higher height.
+        listener.init_from_snapshot(snapshot_with("ETH", 1, 500), 20);
+        let carried = listener.compute_untriggered_snapshot(None).unwrap().2;
+        assert_eq!(carried.len(), 1, "barren snapshot must not wipe the untriggered table");
+        assert_eq!(carried[0].oid, 77);
+
+        // Carried entries must still evict on later terminal statuses.
+        let cancel: Batch<NodeDataOrderStatus> = {
+            let mut order = make_l4_order_json("BTC", 77);
+            order["isTrigger"] = serde_json::json!(true);
+            order["triggerPx"] = serde_json::json!("110.0");
+            serde_json::from_value(serde_json::json!({
+                "local_time": "2024-01-15T10:30:00.000000000",
+                "block_time": "2024-01-15T10:30:00.000000000",
+                "block_number": 30,
+                "events": [{
+                    "time": "2024-01-15T10:30:00.000000000",
+                    "user": "0x0000000000000000000000000000000000000000",
+                    "hash": "0xabc",
+                    "status": "canceled",
+                    "order": order,
+                }]
+            }))
+            .unwrap()
+        };
+        listener.apply_event_batch(30, EventBatch::Orders(cancel), EventSource::OrderStatuses);
+        assert_eq!(listener.compute_untriggered_snapshot(None).unwrap().2.len(), 0);
+    }
+
+    #[test]
+    fn test_install_with_trigger_bearing_snapshot_stays_authoritative() {
+        // When the dump DOES yield triggers, the rebuilt table replaces the old
+        // one wholesale (no merge of stale live entries).
+        let (mut listener, _rx) = ready_listener();
+        listener.apply_event_batch(
+            10,
+            EventBatch::Orders(make_trigger_status_batch("BTC", 77, 10)),
+            EventSource::OrderStatuses,
+        );
+
+        // Snapshot whose ETH book carries one trigger order (tail of both sides).
+        let trigger = InnerL4Order {
+            user: Address::new([3; 20]),
+            coin: Coin::new("ETH"),
+            side: Side::Bid,
+            limit_px: Px::new(500),
+            sz: crate::order_book::Sz::new(100_000_000),
+            oid: 99,
+            timestamp: 0,
+            trigger_condition: "Price above 110".to_string(),
+            is_trigger: true,
+            trigger_px: "110.0".to_string(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: "Stop Market".to_string(),
+            tif: None,
+            cloid: None,
+        };
+        let snapshot = Snapshots::new(
+            std::iter::once((Coin::new("ETH"), Snapshot::from_sides(vec![trigger.clone()], vec![trigger]))).collect(),
+        );
+        listener.init_from_snapshot(snapshot, 20);
+        let table = listener.compute_untriggered_snapshot(None).unwrap().2;
+        assert_eq!(table.len(), 1, "snapshot-yielded triggers replace the old table");
+        assert_eq!(table[0].oid, 99);
     }
 
     /// Feed a paired status + New diff (both halves of an order add) at `height`.

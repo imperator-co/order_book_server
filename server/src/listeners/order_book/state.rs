@@ -177,6 +177,24 @@ impl OrderBookState {
         self.untriggered_orders.values().map(rustc_hash::FxHashMap::len).sum()
     }
 
+    /// Carry the previous state's untriggered table into this freshly-built one
+    /// when the snapshot contributed nothing. The hl-node L4 dump on current
+    /// node versions contains no trigger orders, so a rebuild from it alone
+    /// would wipe everything accumulated from the live status stream on every
+    /// re-sync. When the dump DOES yield triggers, it stays authoritative and
+    /// the previous table is dropped (original wholesale-rebuild semantics).
+    /// Call BEFORE replaying cached events so evictions recorded during the
+    /// fetch window still apply to the carried entries. Cost: Arc bumps only.
+    pub(super) fn carry_forward_untriggered(&mut self, prev: &Self) {
+        if self.track_untriggered && self.untriggered_orders.is_empty() && !prev.untriggered_orders.is_empty() {
+            self.untriggered_orders = prev.untriggered_orders.clone();
+            log::info!(
+                "Snapshot contained no untriggered trigger orders; carried {} forward from previous state",
+                self.untriggered_count()
+            );
+        }
+    }
+
     /// Untriggered trigger orders - all coins, or one coin's when `coin` is
     /// given - along with (time, height). Runs under the listener lock, but
     /// only bumps an Arc refcount per order (no deep clone); an unknown coin
