@@ -88,13 +88,13 @@ fn fetch_snapshot(
                     load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
                 info!("Snapshot fetched");
                 match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        info!("Snapshot loaded at height {}", height);
+                    Ok((height, expected_snapshot, untriggered)) => {
+                        info!("Snapshot loaded at height {} ({} untriggered orders)", height, untriggered.len());
                         // Phased install: build the replacement book and chase
                         // the replay cache down off-lock, then commit in one
                         // short lock hold - ingest keeps serving the current
                         // book for the whole install.
-                        install_snapshot_phased(&listener, expected_snapshot, height).await
+                        install_snapshot_phased(&listener, expected_snapshot, untriggered, height).await
                     }
                     Err(err) => Err(err),
                 }
@@ -144,10 +144,18 @@ const RESYNC_BACKOFF_MAX: Duration = Duration::from_secs(300);
 async fn install_snapshot_phased(
     listener: &Arc<Mutex<OrderBookListener>>,
     snapshot: Snapshots<InnerL4Order>,
+    untriggered: Vec<InnerL4Order>,
     height: u64,
 ) -> Result<()> {
-    install_snapshot_phased_impl(listener, snapshot, height, INSTALL_RESIDUAL_EVENTS_MAX, INSTALL_MAX_CHASE_ROUNDS)
-        .await
+    install_snapshot_phased_impl(
+        listener,
+        snapshot,
+        untriggered,
+        height,
+        INSTALL_RESIDUAL_EVENTS_MAX,
+        INSTALL_MAX_CHASE_ROUNDS,
+    )
+    .await
 }
 
 /// `residual_events_max` and `max_chase_rounds` are threaded through so tests
@@ -157,6 +165,7 @@ async fn install_snapshot_phased(
 async fn install_snapshot_phased_impl(
     listener: &Arc<Mutex<OrderBookListener>>,
     snapshot: Snapshots<InnerL4Order>,
+    untriggered: Vec<InnerL4Order>,
     height: u64,
     residual_events_max: usize,
     max_chase_rounds: usize,
@@ -171,7 +180,7 @@ async fn install_snapshot_phased_impl(
     // runtime worker that connection tasks need.
     let build_start = Instant::now();
     let mut new_state = tokio::task::spawn_blocking(move || {
-        OrderBookState::from_snapshot(snapshot, height, 0, true, ignore_spot, track_untriggered)
+        OrderBookState::from_snapshot(snapshot, untriggered, height, 0, true, ignore_spot, track_untriggered)
     })
     .await?;
     let build_elapsed = build_start.elapsed();
@@ -534,8 +543,15 @@ impl OrderBookListener {
     #[cfg(test)]
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {height}");
-        let mut new_state =
-            OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, self.track_untriggered);
+        let mut new_state = OrderBookState::from_snapshot(
+            snapshot,
+            Vec::new(),
+            height,
+            0,
+            true,
+            self.ignore_spot,
+            self.track_untriggered,
+        );
         // Mirror the production carry-forward (install_snapshot_phased_impl):
         // a snapshot with no triggers must not wipe the accumulated table.
         if let Some(old_state) = self.order_book_state.as_ref() {
@@ -2259,9 +2275,16 @@ mod tests {
 
         // residual_events_max = 0 forces the cache through at least one
         // off-lock chase round before the commit sees an empty cache.
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 150, 0, INSTALL_MAX_CHASE_ROUNDS)
-            .await
-            .expect("install");
+        install_snapshot_phased_impl(
+            &listener,
+            Snapshots::new(HashMap::new()),
+            Vec::new(),
+            150,
+            0,
+            INSTALL_MAX_CHASE_ROUNDS,
+        )
+        .await
+        .expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready());
@@ -2284,9 +2307,16 @@ mod tests {
             assert!(guard.universe().contains("ETH"), "events during a re-sync still apply to the live book");
         }
 
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 15, 0, INSTALL_MAX_CHASE_ROUNDS)
-            .await
-            .expect("install");
+        install_snapshot_phased_impl(
+            &listener,
+            Snapshots::new(HashMap::new()),
+            Vec::new(),
+            15,
+            0,
+            INSTALL_MAX_CHASE_ROUNDS,
+        )
+        .await
+        .expect("install");
 
         let guard = listener.lock().await;
         let universe = guard.universe();
@@ -2305,7 +2335,7 @@ mod tests {
         listener.lock().await.begin_caching();
         feed_order(&mut *listener.lock().await, "NEW", 1, 200);
 
-        install_snapshot_phased(&listener, Snapshots::new(HashMap::new()), 150).await.expect("install");
+        install_snapshot_phased(&listener, Snapshots::new(HashMap::new()), Vec::new(), 150).await.expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready());
@@ -2330,9 +2360,16 @@ mod tests {
             assert!(!cache_alive, "overflow must drop the cache");
         }
 
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 5, 0, INSTALL_MAX_CHASE_ROUNDS)
-            .await
-            .expect("install");
+        install_snapshot_phased_impl(
+            &listener,
+            Snapshots::new(HashMap::new()),
+            Vec::new(),
+            5,
+            0,
+            INSTALL_MAX_CHASE_ROUNDS,
+        )
+        .await
+        .expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready(), "the fresh snapshot still supersedes the stale book");
@@ -2354,7 +2391,7 @@ mod tests {
             feed_order(&mut guard, "NEW", 1, 200);
         }
 
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), 150, 0, 0).await.expect("install");
+        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), Vec::new(), 150, 0, 0).await.expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready(), "the fresh snapshot still supersedes the stale book");

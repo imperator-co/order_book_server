@@ -53,19 +53,30 @@ pub(super) struct OrderBookState {
 impl OrderBookState {
     pub(super) fn from_snapshot(
         mut snapshot: Snapshots<InnerL4Order>,
+        untriggered: Vec<InnerL4Order>,
         height: u64,
         time: u64,
         ignore_triggers: bool,
         ignore_spot: bool,
         track_untriggered: bool,
     ) -> Self {
-        // When triggers are excluded from the book (production), keep them in the
-        // side table instead of dropping them. The oid insert dedupes the two
-        // per-side copies the node snapshot emits for each trigger order.
+        // Seed the side table from the dump's untriggered_orders section
+        // (--include-trigger-orders) - the full standing stop book, one entry
+        // per order. The legacy tail extraction below covers old-format dumps
+        // where triggers were appended to both sides of the book instead.
         let mut untriggered_orders: rustc_hash::FxHashMap<
             Coin,
             rustc_hash::FxHashMap<Oid, std::sync::Arc<InnerL4Order>>,
         > = rustc_hash::FxHashMap::default();
+        if track_untriggered {
+            for order in untriggered {
+                if ignore_spot && order.coin.is_spot() {
+                    continue;
+                }
+                let oid = order.oid();
+                untriggered_orders.entry(order.coin.clone()).or_default().insert(oid, std::sync::Arc::new(order));
+            }
+        }
         if ignore_triggers && track_untriggered {
             for order in snapshot.extract_triggers() {
                 if ignore_spot && order.coin.is_spot() {
@@ -471,7 +482,7 @@ mod tests {
 
     fn empty_state() -> OrderBookState {
         let snapshots = Snapshots::new(HashMap::new());
-        OrderBookState::from_snapshot(snapshots, 0, 0, true, false, true)
+        OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, false, true)
     }
 
     fn make_l4_order(coin: &str, oid: u64) -> L4Order {
@@ -602,7 +613,7 @@ mod tests {
     #[test]
     fn test_from_snapshot_extracts_untriggered_triggers() {
         let snapshots = snapshot_with_triggers("BTC", &[1, 2], &[100, 101]);
-        let state = OrderBookState::from_snapshot(snapshots, 0, 0, true, false, true);
+        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, false, true);
         // Triggers are kept in the side table (deduped from the two per-side
         // copies), not dropped - and never enter the book.
         assert_eq!(state.untriggered_count(), 2);
@@ -618,7 +629,7 @@ mod tests {
     fn test_from_snapshot_ignore_triggers_false_keeps_old_semantics() {
         // Tests that opt out of trigger extraction must not populate the table.
         let snapshots = snapshot_with_triggers("BTC", &[1], &[]);
-        let state = OrderBookState::from_snapshot(snapshots, 0, 0, false, false, true);
+        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, false, false, true);
         assert_eq!(state.untriggered_count(), 0);
     }
 
@@ -686,7 +697,8 @@ mod tests {
     fn test_spot_triggers_skipped_when_ignore_spot() {
         // Live path: spot trigger opens are not tracked under ignore_spot,
         // matching the diff path's spot filtering.
-        let mut state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, true, true);
+        let mut state =
+            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), Vec::new(), 0, 0, true, true, true);
         state
             .apply_order_statuses_hft(make_status_batch(vec![
                 make_trigger_status("@1", 1, "open", "1.0"),
@@ -699,9 +711,29 @@ mod tests {
         assert_eq!(orders[0].coin, Coin::new("BTC"));
 
         // Snapshot path: spot triggers are likewise dropped at install.
-        let spot_state =
-            OrderBookState::from_snapshot(snapshot_with_triggers("@1", &[1], &[100]), 0, 0, true, true, true);
+        let spot_state = OrderBookState::from_snapshot(
+            snapshot_with_triggers("@1", &[1], &[100]),
+            Vec::new(),
+            0,
+            0,
+            true,
+            true,
+            true,
+        );
         assert_eq!(spot_state.untriggered_count(), 0);
+    }
+
+    #[test]
+    fn test_from_snapshot_seeds_from_untriggered_list() {
+        // The --include-trigger-orders dump path: untriggered orders arrive as a
+        // flat list, not embedded in the book sides.
+        let seed = vec![make_inner_order("BTC", 100, true), make_inner_order("ETH", 101, true)];
+        let state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), seed, 0, 0, true, false, true);
+        assert_eq!(state.untriggered_count(), 2);
+        assert_eq!(state.order_count(), 0);
+        let (_, _, btc) = state.untriggered_snapshot(Some(&Coin::new("BTC")));
+        assert_eq!(btc.len(), 1);
+        assert_eq!(btc[0].oid, 100);
     }
 
     #[test]
@@ -709,8 +741,15 @@ mod tests {
         // --bbo-only: neither the snapshot extraction nor live statuses populate
         // the table (the book still strips triggers), so the lightweight memory
         // envelope holds.
-        let mut state =
-            OrderBookState::from_snapshot(snapshot_with_triggers("BTC", &[1], &[100]), 0, 0, true, false, false);
+        let mut state = OrderBookState::from_snapshot(
+            snapshot_with_triggers("BTC", &[1], &[100]),
+            Vec::new(),
+            0,
+            0,
+            true,
+            false,
+            false,
+        );
         assert_eq!(state.untriggered_count(), 0);
         assert_eq!(state.order_count(), 1, "book triggers must still be stripped when tracking is off");
         state
@@ -912,7 +951,7 @@ mod tests {
     #[test]
     fn test_spot_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true, true); // ignore_spot=true
+        let mut state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, true, true); // ignore_spot=true
 
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();

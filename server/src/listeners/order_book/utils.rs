@@ -56,6 +56,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                     "Mainnet",
                     "compute-l4-snapshots",
                     "--include-users",
+                    "--include-trigger-orders",
                     "hl/hyperliquid_data/abci_state.rmp",
                     "hl/snapshot.json",
                 ])
@@ -88,7 +89,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
 
             info!(
-                "Running: {} --chain Mainnet compute-l4-snapshots --include-users {} {}",
+                "Running: {} --chain Mainnet compute-l4-snapshots --include-users --include-trigger-orders {} {}",
                 &config.hlnode_binary,
                 abci_path.display(),
                 output_path.display()
@@ -100,6 +101,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                     "Mainnet",
                     "compute-l4-snapshots",
                     "--include-users",
+                    "--include-trigger-orders",
                     abci_path.to_str().unwrap_or(""),
                     output_path.to_str().unwrap_or(""),
                 ])

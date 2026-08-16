@@ -156,32 +156,62 @@ impl<O: InnerOrder> OrderBooks<O> {
     }
 }
 
-/// Convert the CLI's parsed `(coin, [bids, asks])` list into typed snapshots.
-fn convert_cli_snapshot<O, R>(snapshot: Vec<(String, [Vec<R>; 2])>, height: u64) -> Result<(u64, Snapshots<O>)>
+/// One market's entry in the hl-node CLI dump. Without `--include-trigger-orders`
+/// the value is a bare `[bids, asks]` pair; with it, an object that also carries
+/// the pending trigger orders (`{"book_orders": [[bids],[asks]],
+/// "untriggered_orders": [...]}`). Untagged so both dump formats parse.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CliMarket<R> {
+    Sides([Vec<R>; 2]),
+    WithTriggers { book_orders: [Vec<R>; 2], untriggered_orders: Vec<R> },
+}
+
+/// Convert the CLI's parsed per-coin list into typed snapshots plus the flat
+/// untriggered trigger-order list. Book conversion stays strict (a corrupt
+/// book order poisons the install); untriggered conversion is lenient - a bad
+/// entry is skipped and counted, since it only degrades the side table, and
+/// failing the whole snapshot for it would wedge every re-sync.
+#[allow(clippy::type_complexity)]
+fn convert_cli_snapshot<O, R>(snapshot: Vec<(String, CliMarket<R>)>, height: u64) -> Result<(u64, Snapshots<O>, Vec<O>)>
 where
     O: TryFrom<R, Error = Error>,
 {
-    Ok((
-        height,
-        Snapshots::new(
-            snapshot
-                .into_iter()
-                .map(|(coin, [bids, asks])| {
-                    let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                    let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                    Ok((Coin::new(&coin), Snapshot([bids, asks])))
-                })
-                .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
-        ),
-    ))
+    let mut untriggered: Vec<O> = Vec::new();
+    let mut untriggered_skipped = 0usize;
+    let books = snapshot
+        .into_iter()
+        .map(|(coin, market)| {
+            let ([bids, asks], pending) = match market {
+                CliMarket::Sides(sides) => (sides, Vec::new()),
+                CliMarket::WithTriggers { book_orders, untriggered_orders } => (book_orders, untriggered_orders),
+            };
+            for raw in pending {
+                match O::try_from(raw) {
+                    Ok(order) => untriggered.push(order),
+                    Err(_) => untriggered_skipped += 1,
+                }
+            }
+            let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+            let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+            Ok((Coin::new(&coin), Snapshot([bids, asks])))
+        })
+        .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?;
+    if untriggered_skipped > 0 {
+        crate::metrics::PARSE_ERRORS_TOTAL.with_label_values(&["untriggered"]).inc_by(untriggered_skipped as u64);
+        log::warn!("Skipped {untriggered_skipped} unparseable untriggered orders in snapshot");
+    }
+    Ok((height, Snapshots::new(books), untriggered))
 }
 
 /// Load snapshots from CLI-generated JSON file + height from visor state.
-/// Height is read separately from visor_abci_state.json.
+/// Height is read separately from visor_abci_state.json. Returns the typed
+/// books plus the flat untriggered trigger-order list (empty for dumps made
+/// without `--include-trigger-orders`).
 pub(crate) async fn load_snapshots_from_cli_json<O, R>(
     snapshot_path: &Path,
     visor_state_path: &Path,
-) -> Result<(u64, Snapshots<O>)>
+) -> Result<(u64, Snapshots<O>, Vec<O>)>
 where
     O: TryFrom<R, Error = Error> + Send + 'static,
     R: Serialize + for<'a> Deserialize<'a> + Send + 'static,
@@ -198,11 +228,10 @@ where
     // while both the old and new books are alive during the install.
     let snapshot_path = snapshot_path.to_path_buf();
     let parse_start = std::time::Instant::now();
-    let parsed = tokio::task::spawn_blocking(move || -> Result<(u64, Snapshots<O>)> {
+    let parsed = tokio::task::spawn_blocking(move || -> Result<(u64, Snapshots<O>, Vec<O>)> {
         let file = fs::File::open(&snapshot_path)?;
         let reader = std::io::BufReader::with_capacity(1 << 20, file);
-        #[allow(clippy::type_complexity)]
-        let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_reader(reader)?;
+        let snapshot: Vec<(String, CliMarket<R>)> = serde_json::from_reader(reader)?;
         convert_cli_snapshot(snapshot, height)
     })
     .await??;
@@ -431,6 +460,35 @@ mod tests {
     #[test]
     fn test_deserialization() -> Result<()> {
         load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON)?;
+        Ok(())
+    }
+
+    /// The --include-trigger-orders dump format: per-coin objects with
+    /// `book_orders` + `untriggered_orders`. Both this and the legacy bare
+    /// `[bids, asks]` form must parse via the untagged CliMarket enum, and the
+    /// untriggered list must come through typed.
+    #[test]
+    fn test_cli_snapshot_with_trigger_orders_format() -> Result<()> {
+        let order = |oid: u64, is_trigger: bool| {
+            serde_json::json!(["0x0000000000000000000000000000000000000001", {
+                "coin": "BTC", "side": "B", "limitPx": "100.0", "sz": "1.0", "oid": oid,
+                "timestamp": 1000, "triggerCondition": if is_trigger {"Price above 110"} else {"N/A"},
+                "isTrigger": is_trigger, "triggerPx": if is_trigger {"110.0"} else {"0.0"},
+                "children": [], "isPositionTpsl": false, "reduceOnly": false,
+                "orderType": if is_trigger {"Stop Market"} else {"Limit"},
+                "origSz": "1.0", "tif": null, "cloid": null
+            }])
+        };
+        let json = serde_json::json!([
+            ["BTC", { "book_orders": [[order(1, false)], []], "untriggered_orders": [order(100, true), order(101, true)] }],
+            ["ETH", [[order(2, false)], []]]
+        ]);
+        let parsed: Vec<(String, super::CliMarket<(Address, L4Order)>)> = serde_json::from_value(json)?;
+        let (height, snapshots, untriggered) = super::convert_cli_snapshot::<InnerL4Order, _>(parsed, 42)?;
+        assert_eq!(height, 42);
+        assert_eq!(snapshots.value().len(), 2, "both formats must yield books");
+        assert_eq!(untriggered.len(), 2);
+        assert!(untriggered.iter().all(|o| o.is_trigger && o.trigger_px == "110.0"));
         Ok(())
     }
 
