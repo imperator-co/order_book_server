@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
 };
-use tokio::fs::read_to_string;
 
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
@@ -159,12 +158,62 @@ impl<O: InnerOrder> OrderBooks<O> {
 /// One market's entry in the hl-node CLI dump. Without `--include-trigger-orders`
 /// the value is a bare `[bids, asks]` pair; with it, an object that also carries
 /// the pending trigger orders (`{"book_orders": [[bids],[asks]],
-/// "untriggered_orders": [...]}`). Untagged so both dump formats parse.
-#[derive(Deserialize)]
-#[serde(untagged)]
+/// "untriggered_orders": [...]}`).
 enum CliMarket<R> {
     Sides([Vec<R>; 2]),
     WithTriggers { book_orders: [Vec<R>; 2], untriggered_orders: Vec<R> },
+}
+
+/// Hand-written instead of `#[serde(untagged)]`: untagged enums buffer every
+/// element into serde's intermediate `Content` tree before trying variants -
+/// on a 400MB dump that cost ~2-2.5x parse CPU plus a multi-MB transient
+/// allocation per market, and reduced any inner parse error to an unusable
+/// "data did not match any variant". A seq/map visitor dispatches on the
+/// JSON shape in a single streaming pass and keeps precise error positions.
+impl<'de, R: Deserialize<'de>> Deserialize<'de> for CliMarket<R> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct MarketVisitor<R>(std::marker::PhantomData<R>);
+
+        impl<'de, R: Deserialize<'de>> serde::de::Visitor<'de> for MarketVisitor<R> {
+            type Value = CliMarket<R>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a [bids, asks] pair or an object with book_orders/untriggered_orders")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let bids = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let asks = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                Ok(CliMarket::Sides([bids, asks]))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut book_orders: Option<[Vec<R>; 2]> = None;
+                let mut untriggered_orders: Option<Vec<R>> = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "book_orders" => book_orders = Some(map.next_value()?),
+                        "untriggered_orders" => untriggered_orders = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(CliMarket::WithTriggers {
+                    book_orders: book_orders.ok_or_else(|| serde::de::Error::missing_field("book_orders"))?,
+                    untriggered_orders: untriggered_orders.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(MarketVisitor(std::marker::PhantomData))
+    }
 }
 
 /// Convert the CLI's parsed per-coin list into typed snapshots plus the flat
@@ -204,23 +253,20 @@ where
     Ok((height, Snapshots::new(books), untriggered))
 }
 
-/// Load snapshots from CLI-generated JSON file + height from visor state.
-/// Height is read separately from visor_abci_state.json. Returns the typed
-/// books plus the flat untriggered trigger-order list (empty for dumps made
-/// without `--include-trigger-orders`).
+/// Load snapshots from a CLI-generated JSON file. `height` is the caller's
+/// replay cutoff - it MUST be a lower bound of the dump's content height
+/// (read the visor state BEFORE invoking the dump), so replay above it can
+/// only over-apply idempotently, never skip events the snapshot lacks.
+/// Returns the typed books plus the flat untriggered trigger-order list
+/// (empty for dumps made without `--include-trigger-orders`).
 pub(crate) async fn load_snapshots_from_cli_json<O, R>(
     snapshot_path: &Path,
-    visor_state_path: &Path,
+    height: u64,
 ) -> Result<(u64, Snapshots<O>, Vec<O>)>
 where
     O: TryFrom<R, Error = Error> + Send + 'static,
     R: Serialize + for<'a> Deserialize<'a> + Send + 'static,
 {
-    // Read height from visor_abci_state.json
-    let visor_state = read_to_string(visor_state_path).await?;
-    let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
-    let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
-
     // The snapshot file is hundreds of MB; deserialize + convert is seconds of
     // pure CPU, so it runs on a blocking thread instead of pinning a runtime
     // worker for the duration. Streaming from the file (instead of reading it

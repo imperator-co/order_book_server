@@ -80,12 +80,25 @@ fn fetch_snapshot(
             listener.begin_caching();
         }
 
-        // Now generate snapshot - any events during this time are cached
+        // Read the height BEFORE the dump runs: the dump's content is at least
+        // this fresh, so a replay cutoff at this height can only over-replay
+        // (idempotent - duplicate adds are dropped by the oid guard, cancels of
+        // absent orders no-op). Reading it AFTER the dump over-stated the
+        // cutoff by the whole dump window and silently discarded every cached
+        // add/cancel inside it - permanent anchor holes and phantom orders,
+        // re-seeded at every install.
         let visor_path = get_visor_path(&snapshot_config);
+        let pre_dump_height = read_visor_height(&visor_path);
+
+        // Now generate snapshot - any events during this time are cached
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
-                let snapshot =
-                    load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
+                let snapshot = match pre_dump_height {
+                    Some(height) => {
+                        load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, height).await
+                    }
+                    None => Err("visor state height unavailable before dump".into()),
+                };
                 info!("Snapshot fetched");
                 match snapshot {
                     Ok((height, expected_snapshot, untriggered)) => {
@@ -130,6 +143,18 @@ const INSTALL_MAX_CHASE_ROUNDS: usize = 32;
 /// install that left the book marked doubles it, up to the cap.
 const RESYNC_BACKOFF_BASE: Duration = Duration::from_secs(10);
 const RESYNC_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+// insertBefore fallbacks are metrics-only, never a desync reason. The anchor
+// race is architectural to this fork's event-by-event pipeline: cancels apply
+// instantly from the diff stream, while an anchored add must wait for its
+// status half to pair - an anchor placed and canceled within the same wave
+// (HFT quote churn) reliably loses the race. Verified empirically: missing
+// anchors are oids placed fractions of a second earlier and already gone from
+// the node's own book. A snapshot re-fetch cannot fix a timing race, and
+// marking these desynced kept the fetch loop permanently armed (a 20s
+// host-wide hl-node dump every backoff period, forever). Queue priority
+// self-corrects as levels churn; price/size state is never affected. Track
+// the rate via insert_before_fallback_total against insert_before_honored_total.
 
 /// Install a fetched snapshot without freezing ingest: build the replacement
 /// book on a blocking thread, then repeatedly steal the replay cache and
@@ -314,18 +339,9 @@ pub(crate) struct OrderBookListener {
     // reacts by re-fetching a snapshot, which rebuilds the book and clears this.
     needs_resync: bool,
     // True when the pending desync involves real data loss (wrong price/size
-    // state), as opposed to insertBefore fallbacks, which only degrade
-    // intra-level queue priority. Loss resyncs are fetched promptly; fallback
-    // resyncs are coalesced (see resync_is_urgent) because a 10-30s host-wide
-    // hl-node dump per lone fallback caused resync storms under load.
+    // state). Every desync reason is loss now that insertBefore fallbacks are
+    // metrics-only (see the comment at the resync backoff constants).
     resync_data_loss: bool,
-    // When the first fallback-only desync of the current epoch was marked;
-    // a pending fallback desync older than FALLBACK_RESYNC_COALESCE is fetched
-    // even without a burst. Cleared by each snapshot install.
-    priority_desync_since: Option<Instant>,
-    // insertBefore fallbacks observed since the last snapshot install; at
-    // FALLBACK_RESYNC_BURST the fallback desync turns urgent.
-    recent_fallbacks: u64,
     // When true, mark_desynced still counts the desync metric but does NOT set
     // needs_resync, so the book keeps serving live events through drift instead
     // of re-fetching a snapshot. Operator opt-in (--no-resync) for environments
@@ -398,8 +414,6 @@ impl OrderBookListener {
             cache_event_cap: MAX_CACHED_EVENTS,
             needs_resync: false,
             resync_data_loss: false,
-            priority_desync_since: None,
-            recent_fallbacks: 0,
             tolerate_drift: false,
             track_untriggered: true,
             max_loss_height: 0,
@@ -490,15 +504,9 @@ impl OrderBookListener {
             error!("Order book marked out-of-sync ({reason}); scheduling snapshot re-fetch");
         }
         self.needs_resync = true;
-        // Classify for fetch urgency: fallbacks only degrade queue priority,
-        // everything else means lost events (wrong price/size state).
-        if reason == "insert_before_fallback" {
-            if self.priority_desync_since.is_none() {
-                self.priority_desync_since = Some(Instant::now());
-            }
-        } else {
-            self.resync_data_loss = true;
-        }
+        // Every mark reason is real event loss (wrong price/size state) -
+        // insertBefore fallbacks are metrics-only and never reach here.
+        self.resync_data_loss = true;
         let state_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
         let observed = state_height.max(self.last_seen_height);
         // No height observed yet (loss before any event parsed): conservative
@@ -512,21 +520,11 @@ impl OrderBookListener {
     }
 
     /// Does the pending desync justify launching a snapshot fetch NOW?
-    /// Data-loss desyncs always do. Fallback-only desyncs are coalesced: they
-    /// fetch immediately only as a burst (`FALLBACK_RESYNC_BURST` since the
-    /// last install - queue priority degrading fast), and a lone fallback
-    /// waits out `FALLBACK_RESYNC_COALESCE` first, so scattered fallbacks
-    /// during a market-hours burst share one rebuild instead of triggering a
-    /// 10-30s host-wide `hl-node` dump every ticker period.
-    fn resync_is_urgent(&self) -> bool {
-        /// Fallbacks since the last install that make the desync urgent.
-        const FALLBACK_RESYNC_BURST: u64 = 8;
-        /// How long a lone fallback desync may wait before fetching anyway.
-        const FALLBACK_RESYNC_COALESCE: Duration = Duration::from_secs(60);
-
+    /// Every mark reason is data loss now (fallbacks are metrics-only), so a
+    /// pending desync is always urgent; the fetch pacing comes from the
+    /// resync backoff alone.
+    const fn resync_is_urgent(&self) -> bool {
         self.resync_data_loss
-            || self.recent_fallbacks >= FALLBACK_RESYNC_BURST
-            || self.priority_desync_since.is_some_and(|since| since.elapsed() >= FALLBACK_RESYNC_COALESCE)
     }
 
     /// Override the replay-cache event cap (operator tuning via
@@ -628,16 +626,17 @@ impl OrderBookListener {
         self.max_loss_height = 0;
         // New desync epoch: the re-marks below start fresh urgency state.
         self.resync_data_loss = false;
-        self.priority_desync_since = None;
-        self.recent_fallbacks = 0;
         if replay_fallbacks > 0 {
+            // Counted for visibility but NOT re-marked: the fresh snapshot is by
+            // construction newer than the queue drift these fallbacks describe
+            // (their anchors were consumed at/below the snapshot height). The old
+            // re-mark made every install re-arm the resync loop - replay windows
+            // reliably produce far more fallbacks than any threshold.
             INSERT_BEFORE_FALLBACK_TOTAL.inc_by(replay_fallbacks);
-            self.recent_fallbacks = replay_fallbacks;
+            info!("Replay produced {replay_fallbacks} insertBefore fallbacks (benign against a fresh snapshot)");
         }
         if replay_failed {
             self.mark_desynced("replay_apply_error");
-        } else if replay_fallbacks > 0 {
-            self.mark_desynced("insert_before_fallback");
         } else if prior_loss_height > height {
             error!(
                 "Data loss bounded by height {prior_loss_height} is above snapshot height {height}; \
@@ -1139,13 +1138,12 @@ impl OrderBookListener {
             };
 
             // Adds whose insertBefore anchor was missing rested at the back of
-            // their level instead - the book kept serving, but queue priority
-            // has diverged from the stream, so schedule a background re-sync.
+            // their level instead. Metrics-only: the miss is an architectural
+            // pairing race (see the comment at the resync backoff constants),
+            // not book divergence - a re-fetch cannot fix it.
             let fallbacks = state.take_insert_before_fallbacks();
             if fallbacks > 0 {
                 INSERT_BEFORE_FALLBACK_TOTAL.inc_by(fallbacks);
-                self.recent_fallbacks += fallbacks;
-                desync_reason = Some("insert_before_fallback");
             }
 
             match result {
@@ -2091,7 +2089,7 @@ mod tests {
     // ==================== insertBefore fallback → re-sync wiring ====================
 
     #[test]
-    fn insert_before_fallback_marks_desync() {
+    fn insert_before_fallback_counted_not_marked() {
         let (mut listener, _rx) = ready_listener();
         feed_order(&mut listener, "BTC", 1, 1);
 
@@ -2104,8 +2102,8 @@ mod tests {
         );
         assert!(!listener.needs_resync(), "a honored insertBefore anchor must not schedule a re-sync");
 
-        // A missing anchor rests the order at the back of the level and marks
-        // the book for re-sync - queue priority has diverged from the stream
+        // A missing anchor rests the order at the back of the level; it is
+        // counted in metrics but never marks the book desynced.
         listener.apply_event_batch(3, EventBatch::Orders(make_status_batch("BTC", 3, 3)), EventSource::OrderStatuses);
         listener.apply_event_batch(
             3,
@@ -2117,7 +2115,7 @@ mod tests {
             )),
             EventSource::OrderDiffs,
         );
-        assert!(listener.needs_resync(), "a missing insertBefore anchor must schedule a re-sync");
+        assert!(!listener.needs_resync(), "a missing anchor must not schedule a re-sync");
     }
 
     // ==================== Gapless snapshot handoff (drift fix) ====================
@@ -2391,7 +2389,9 @@ mod tests {
             feed_order(&mut guard, "NEW", 1, 200);
         }
 
-        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), Vec::new(), 150, 0, 0).await.expect("install");
+        install_snapshot_phased_impl(&listener, Snapshots::new(HashMap::new()), Vec::new(), 150, 0, 0)
+            .await
+            .expect("install");
 
         let guard = listener.lock().await;
         assert!(guard.is_ready(), "the fresh snapshot still supersedes the stale book");
@@ -2415,53 +2415,69 @@ mod tests {
 
     // ==================== Resync damping ====================
 
-    #[test]
-    fn test_lone_fallback_desync_is_coalesced_not_urgent() {
-        let (mut listener, _rx) = ready_listener();
-        feed_order(&mut listener, "BTC", 1, 1);
-        // One missing insertBefore anchor: queue priority drifted, but a lone
-        // fallback must not immediately trigger a 10-30s hl-node dump.
-        listener.apply_event_batch(2, EventBatch::Orders(make_status_batch("BTC", 2, 2)), EventSource::OrderStatuses);
+    /// Feed one order whose insertBefore anchor is missing (falls back).
+    fn feed_fallback_order(listener: &mut OrderBookListener, oid: u64, height: u64) {
         listener.apply_event_batch(
-            2,
-            EventBatch::BookDiffs(make_diff_batch("BTC", 2, 2, serde_json::json!({"new": {"sz": "1.0", "insertBefore": 999}}))),
+            height,
+            EventBatch::Orders(make_status_batch("BTC", oid, height)),
+            EventSource::OrderStatuses,
+        );
+        listener.apply_event_batch(
+            height,
+            EventBatch::BookDiffs(make_diff_batch(
+                "BTC",
+                oid,
+                height,
+                serde_json::json!({"new": {"sz": "1.0", "insertBefore": 999}}),
+            )),
             EventSource::OrderDiffs,
         );
-        assert!(listener.needs_resync(), "the fallback still schedules a re-sync");
-        assert!(!listener.resync_is_urgent(), "a lone fallback is coalesced, not fetched immediately");
-
-        // ...until it has waited out the coalescing window.
-        listener.priority_desync_since = Some(Instant::now() - Duration::from_secs(61));
-        assert!(listener.resync_is_urgent(), "an aged fallback desync must eventually fetch");
     }
 
     #[test]
-    fn test_fallback_burst_is_urgent() {
+    fn test_fallbacks_never_mark_desync_at_any_rate() {
         let (mut listener, _rx) = ready_listener();
         feed_order(&mut listener, "BTC", 1, 1);
-        // A burst of missing anchors (>= FALLBACK_RESYNC_BURST) means queue
-        // priority is degrading fast - fetch without waiting for the window.
-        for i in 0..8_u64 {
-            let oid = 100 + i;
-            let height = 2 + i;
-            listener.apply_event_batch(
-                height,
-                EventBatch::Orders(make_status_batch("BTC", oid, height)),
-                EventSource::OrderStatuses,
-            );
-            listener.apply_event_batch(
-                height,
-                EventBatch::BookDiffs(make_diff_batch(
-                    "BTC",
-                    oid,
-                    height,
-                    serde_json::json!({"new": {"sz": "1.0", "insertBefore": 999}}),
-                )),
-                EventSource::OrderDiffs,
-            );
+        // The anchor race is architectural (cancels outrun anchored-add
+        // pairing); even a sustained storm must stay metrics-only - marking
+        // it desynced armed a permanent 20s-dump re-sync loop in production.
+        for i in 0..200_u64 {
+            feed_fallback_order(&mut listener, 100 + i, 2 + i);
         }
-        assert!(listener.needs_resync());
-        assert!(listener.resync_is_urgent(), "a fallback burst must fetch promptly");
+        assert!(!listener.needs_resync(), "fallbacks are metrics-only, never a desync reason");
+        assert!(!listener.resync_is_urgent());
+    }
+
+    #[test]
+    fn test_replay_fallbacks_do_not_rearm_resync() {
+        let (mut listener, _rx) = ready_listener();
+        listener.begin_caching();
+        // An anchored add with a missing anchor lands during the fetch window:
+        // applied live AND cached for replay.
+        feed_fallback_order(&mut listener, 50, 200);
+        assert!(!listener.needs_resync(), "below the burst threshold nothing marks");
+
+        // The install replays the cached batches (height 200 > 100) onto the
+        // fresh book; the anchor misses again there. That must NOT re-arm the
+        // resync loop - the snapshot is newer than the drift it describes.
+        listener.init_from_snapshot(Snapshots::new(HashMap::new()), 100);
+        assert!(!listener.needs_resync(), "replay fallbacks must not re-mark the fresh book");
+    }
+
+    #[test]
+    fn test_fallback_burst_does_not_raise_loss_bound() {
+        let (mut listener, _rx) = ready_listener();
+        feed_order(&mut listener, "BTC", 1, 1);
+        for i in 0..50_u64 {
+            feed_fallback_order(&mut listener, 100 + i, 500 + i);
+        }
+        assert!(!listener.needs_resync(), "fallbacks never mark");
+        assert_eq!(listener.max_loss_height, 0, "queue-priority fallbacks are not data loss");
+        // With no phantom loss bound, any install fully clears the desync -
+        // the old behavior kept "data loss above snapshot height" scheduled
+        // off a bound that pure fallbacks had raised.
+        listener.init_from_snapshot(Snapshots::new(HashMap::new()), 10);
+        assert!(!listener.needs_resync(), "no phantom loss bound may keep the re-sync scheduled");
     }
 
     #[test]
@@ -2479,14 +2495,10 @@ mod tests {
         // covering snapshot can clear the flag in one install.
         feed_order(&mut listener, "BTC", 1, 100);
         listener.mark_desynced("watcher_data_loss");
-        listener.recent_fallbacks = 100;
-        listener.priority_desync_since = Some(Instant::now() - Duration::from_secs(600));
         listener.begin_caching();
         listener.init_from_snapshot(Snapshots::new(HashMap::new()), 1_000);
         assert!(!listener.needs_resync());
         assert!(!listener.resync_is_urgent(), "a clean install must start a fresh damping epoch");
-        assert_eq!(listener.recent_fallbacks, 0);
-        assert!(listener.priority_desync_since.is_none());
     }
 
     #[test]

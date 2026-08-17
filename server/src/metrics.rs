@@ -153,6 +153,14 @@ lazy_static! {
     /// New diffs whose insertBefore anchor was not resting at the level; the
     /// order was rested at the back of the level instead and a re-sync was
     /// scheduled, since queue priority may be wrong until then.
+    /// Anchored adds whose insertBefore was honored (spliced at the anchor).
+    /// Denominator for the fallback rate: fallback/(honored+fallback) tells
+    /// whether a storm is a hole set or normal pairing-race noise.
+    pub static ref INSERT_BEFORE_HONORED_TOTAL: IntCounter = IntCounter::new(
+        "insert_before_honored_total",
+        "Anchored adds whose insertBefore anchor was honored"
+    ).expect("metric can be created");
+
     pub static ref INSERT_BEFORE_FALLBACK_TOTAL: IntCounter = IntCounter::new(
         "insert_before_fallback_total",
         "New diffs whose insertBefore anchor was missing; order rested at back of level"
@@ -303,6 +311,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();
 
     // File watcher metrics
     REGISTRY.register(Box::new(FILE_EVENTS_TOTAL.clone())).ok();

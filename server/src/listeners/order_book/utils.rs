@@ -155,9 +155,12 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
 }
 
 /// Current node height from `visor_abci_state.json`, or None if unreadable.
-/// Used as the startup-backfill floor: the initial snapshot's height is never
-/// below this value (the snapshot is generated after boot and heights only
-/// advance), so every line at or below it is already covered by the snapshot.
+/// Read BEFORE a dump is generated, it is a lower bound of the dump's content
+/// height (heights only advance), which makes it safe for both of its uses:
+/// as the startup-backfill floor (every line at or below it is covered by the
+/// snapshot) and as the replay cutoff (replaying events above it can only
+/// over-apply idempotently, never skip events the snapshot lacks). Reading it
+/// AFTER the dump would over-state the cutoff by the whole dump window.
 pub(super) fn read_visor_height(visor_path: &std::path::Path) -> Option<u64> {
     let contents = fs::read_to_string(visor_path).ok()?;
     let visor: serde_json::Value = serde_json::from_str(&contents).ok()?;

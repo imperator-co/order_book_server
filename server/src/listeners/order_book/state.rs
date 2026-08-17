@@ -115,10 +115,16 @@ impl OrderBookState {
         std::mem::take(&mut self.insert_before_fallbacks)
     }
 
-    /// Record that `insert_before` could not be honored for this order.
-    fn note_insert_before_fallback(&mut self, oid: &Oid, coin: &Coin) {
+    /// Record that `insert_before` could not be honored for this order. The
+    /// anchor oid and price level are logged so a fallback storm can be traced
+    /// to its hole set (which orders are missing, at which levels) instead of
+    /// only naming the order that fell back.
+    fn note_insert_before_fallback(&mut self, oid: &Oid, coin: &Coin, anchor: Option<&Oid>, px: crate::order_book::Px) {
         self.insert_before_fallbacks += 1;
-        log::warn!("insertBefore anchor missing for oid={oid:?} coin={coin:?}; order rested at back of level");
+        log::warn!(
+            "insertBefore anchor {anchor:?} missing at px={} for oid={oid:?} coin={coin:?}; rested at back of level",
+            px.to_str()
+        );
     }
 
     pub(super) const fn height(&self) -> u64 {
@@ -379,8 +385,12 @@ impl OrderBookState {
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(sz);
                 inner_order.convert_trigger(time.max(0) as u64);
+                let px = inner_order.limit_px();
+                let anchor = insert_before.clone();
                 if self.order_book.add_order_before(inner_order, insert_before) {
-                    self.note_insert_before_fallback(&oid, &order_coin);
+                    self.note_insert_before_fallback(&oid, &order_coin, anchor.as_ref(), px);
+                } else if anchor.is_some() {
+                    crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
                 }
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
@@ -447,8 +457,12 @@ impl OrderBookState {
                         inner_order.modify_sz(sz);
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
+                        let px = inner_order.limit_px();
+                        let anchor = insert_before.clone();
                         if self.order_book.add_order_before(inner_order, insert_before) {
-                            self.note_insert_before_fallback(&oid, &order_coin);
+                            self.note_insert_before_fallback(&oid, &order_coin, anchor.as_ref(), px);
+                        } else if anchor.is_some() {
+                            crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
                         }
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
