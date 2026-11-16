@@ -101,19 +101,19 @@ async fn heartbeat_tick(ticker: &mut Option<tokio::time::Interval>) {
 
 pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // One channel multiplexes every event (L2/BBO/L4/fills) to all connections.
-    // In `--stream-with-block-info` mode the listener emits one message per node
-    // event (order statuses/diffs: thousands/s), so depth 32 drained in
-    // milliseconds and any consumer jitter tripped `RecvError::Lagged`, evicting
-    // messages across all channels. Even with batch draining and shared frames,
-    // a single trades subscriber lost ~71% of trades on a busy mainnet window at
-    // depth 32 vs ~1.7% at 16384, in the same conditions. 16384 gives seconds of
-    // headroom; each slot is one Arc pointer and a persistently-slow consumer
-    // still sheds via Lagged, so memory stays bounded.
-    // TODO: this is a mitigation, not a fix — loss is still cross-channel
-    // (residual ~1.7% above) and every connection is woken for the full L4
-    // firehose. Splitting into per-message-type channels, subscribed per
-    // connection as needed, would decouple loss domains and wakeup cost.
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
+    // The listener emits one message per node event (order statuses/diffs: tens
+    // of thousands/s on mainnet; BboUpdate alone averages ~18k/s), so the
+    // capacity is the headroom, in messages, a connection task may fall behind
+    // during a burst before `RecvError::Lagged` evicts messages across all
+    // channels. The old 16384 was under a second at mainnet rates and lagged in
+    // bursts (sizing: `DEFAULT_BROADCAST_CAPACITY`). A queued message stays
+    // alive until every receiver has seen it, so its memory is only paid while
+    // some connection is actually behind.
+    // TODO: loss is still cross-channel and every connection is woken for the
+    // full firehose. Per-message-type channels, subscribed per connection as
+    // needed, would decouple loss domains and wakeup cost.
+    let capacity = if config.broadcast_capacity > 0 { config.broadcast_capacity } else { crate::DEFAULT_BROADCAST_CAPACITY };
+    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(capacity);
 
     // Market filter flags from config
     let market_filter = (config.include_perps, config.include_spot, config.include_hip3);

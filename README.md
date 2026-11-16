@@ -156,6 +156,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `--l2book-heartbeat-ms` | `0` | If > 0, resend the last `l2Book` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--bbo-heartbeat-ms` | `0` | If > 0, resend the last `bbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--no-resync` | `false` | Tolerate drift instead of re-syncing. Data-loss events are still counted in `orderbook_desyncs_total` but never trigger a snapshot re-fetch. See [Drift tolerance](#drift-tolerance) |
+| `--broadcast-capacity` | `1048576` | Messages one connection may fall behind the event stream (one message per node event: ~42k/s average, ~105k/s peak on mainnet perps) before it loses messages, counted in `channel_drops_total`. The default holds 5 s (the slow-client send timeout) of peak traffic including L4 subscriptions. Slots cost ~40 B each; queued messages (~1.7 KB, ~2.6 KB with L4) are only held while a connection lags, worst case ~1.8-2.7 GB |
 
 ### Drift tolerance
 
