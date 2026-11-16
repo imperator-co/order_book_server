@@ -33,7 +33,7 @@ pub(super) struct SnapshotConfig {
 }
 
 pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf> {
-    info!("Triggering L4 snapshot via hl-node CLI (mode: {:?})...", config.mode);
+    info!("Triggering L4 snapshot (mode: {:?})...", config.mode);
 
     // The dump runs on the same host that produces and parses the stream, so
     // its wall-clock duration is the first thing to check when a re-sync
@@ -79,6 +79,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
 
             output_path
         }
+        SnapshotMode::Info => node_file_snapshot(config).await?,
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
             let abci_path = config.abci_state_path.clone().unwrap_or_else(|| {
@@ -129,7 +130,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
 
     let dump_elapsed = dump_start.elapsed();
     RESYNC_PHASE_DURATION.with_label_values(&["fetch_dump"]).observe(dump_elapsed.as_secs_f64());
-    info!("hl-node compute-l4-snapshots completed in {}ms (mode: {:?})", dump_elapsed.as_millis(), config.mode);
+    info!("L4 snapshot dump completed in {}ms (mode: {:?})", dump_elapsed.as_millis(), config.mode);
 
     // Verify file exists
     if output_path.exists() {
@@ -152,6 +153,24 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
     }
 
     Err("Snapshot file not created".into())
+}
+
+/// Ask the node's info server to write a snapshot of its CURRENT state, with
+/// that state's height, to the output path: `[height, markets]`. The node
+/// process writes the file.
+async fn node_file_snapshot(config: &SnapshotConfig) -> Result<PathBuf> {
+    let output_path = config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
+    // A file left from an earlier fetch carries its own, old height.
+    let _unused = fs::remove_file(&output_path);
+    let payload = serde_json::json!({
+        "type": "fileSnapshot",
+        "request": { "type": "l4Snapshots", "includeUsers": true, "includeTriggerOrders": true },
+        "outPath": output_path,
+        "includeHeightInOutput": true
+    });
+    let request = reqwest::Client::new().post(format!("http://{}/info", crate::NODE_INFO_ADDR)).json(&payload).send();
+    tokio::time::timeout(std::time::Duration::from_secs(120), request).await??.error_for_status()?;
+    Ok(output_path)
 }
 
 /// Current node height from `visor_abci_state.json`, or None if unreadable.

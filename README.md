@@ -130,7 +130,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--snapshot-mode` | `docker` | `docker` or `direct` |
+| `--snapshot-mode` | `docker` | `docker`, `direct` or `info`. `info` asks the running node's info server (`--serve-info`, `127.0.0.1:3001`) for a snapshot of its current state, which carries its exact height: that height is the replay cutoff, not the visor height; `docker` / `direct` dump the node's persisted `abci_state.rmp` and take the height from the visor state, which is only right while that file is as fresh as the visor height. In `info` mode the **node** writes `--snapshot-output-path` (default `/tmp/hl_snapshot.json`): it must be a path both processes see (not with `PrivateTmp=true`; with a node in Docker, a shared volume at the same path) |
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
@@ -624,6 +624,8 @@ The original fetches snapshots via HTTP POST to `localhost:3001` (the node's loc
 This fork calls `hl-node compute-l4-snapshots` directly, with two modes:
 - **Docker**: `docker exec <container> hl-node ...` for container-based setups
 - **Direct**: calls the binary on the host for systemctl / bare metal deployments
+
+The info-server request remains available as an opt-in third mode, `--snapshot-mode info`: its snapshot carries its exact height, while the CLI dump of `abci_state.rmp` is only as fresh as the node's last write of that file (see [Snapshot Mode](#snapshot-mode)).
 
 All paths (`abci_state.rmp`, `snapshot.json`, `visor_abci_state.json`) are auto-detected with manual override options.
 

@@ -10,7 +10,7 @@ use crate::{
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
-        multi_book::{Snapshots, load_snapshots_from_cli_json},
+        multi_book::{Snapshots, load_snapshots_from_cli_json, load_snapshots_with_height},
     },
     prelude::*,
     types::{
@@ -87,13 +87,15 @@ fn fetch_snapshot(
         // cutoff by the whole dump window and silently discarded every cached
         // add/cancel inside it - permanent anchor holes and phantom orders,
         // re-seeded at every install.
-        let visor_path = get_visor_path(&snapshot_config);
-        let pre_dump_height = read_visor_height(&visor_path);
+        // Info mode needs no outside cutoff: its snapshot carries its own, exact height.
+        let info_mode = snapshot_config.mode == crate::SnapshotMode::Info;
+        let pre_dump_height = if info_mode { None } else { read_visor_height(&get_visor_path(&snapshot_config)) };
 
         // Now generate snapshot - any events during this time are cached
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
                 let snapshot = match pre_dump_height {
+                    _ if info_mode => load_snapshots_with_height::<InnerL4Order, (Address, L4Order)>(&output_fln).await,
                     Some(height) => {
                         load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, height).await
                     }
@@ -331,6 +333,9 @@ pub(crate) struct OrderBookListener {
     // snapshot -> live-stream handoff gapless. None in steady state (no caching
     // cost per event).
     fetched_snapshot_cache: Option<VecDeque<EventBatch>>,
+    // Height of the last installed snapshot: a late backfill batch at or below
+    // it is already in the book.
+    installed_height: u64,
     // Total events across all cached batches; bounded by cache_event_cap.
     cached_event_count: usize,
     cache_event_cap: usize,
@@ -410,6 +415,7 @@ impl OrderBookListener {
             // started yet, and anything arriving before it completes must be
             // replayable or it is lost (the pre-existing startup drift window).
             fetched_snapshot_cache: Some(VecDeque::new()),
+            installed_height: 0,
             cached_event_count: 0,
             cache_event_cap: MAX_CACHED_EVENTS,
             needs_resync: false,
@@ -606,6 +612,7 @@ impl OrderBookListener {
         // Stop caching: after the swap below, live batches apply directly.
         let cache = self.fetched_snapshot_cache.take().unwrap_or_default();
         self.cached_event_count = 0;
+        self.installed_height = height;
         for batch in cache {
             replay_failed |= replay_batch_above(&mut new_state, batch, height, &mut replayed);
         }
@@ -1011,15 +1018,19 @@ impl OrderBookListener {
     /// construction, and applying e.g. a stale size update on top of newer
     /// state would corrupt the book. If the replay cache is already gone (the
     /// snapshot landed before the backfill drained, or the cache overflowed),
-    /// the batch cannot be used safely - mark the book for re-sync instead; the
-    /// re-fetched snapshot's height supersedes everything the backfill carried.
+    /// a batch above the installed snapshot's height cannot be used safely -
+    /// mark the book for re-sync instead; the re-fetched snapshot's height
+    /// supersedes everything the backfill carried. A batch at or below that
+    /// height is already in the book and is dropped.
     fn cache_backfill_batch(&mut self, event_batch: EventBatch) {
-        if matches!(event_batch, EventBatch::Fills(_)) {
-            return;
-        }
+        let height = match &event_batch {
+            EventBatch::Orders(b) => b.block_number(),
+            EventBatch::BookDiffs(b) => b.block_number(),
+            EventBatch::Fills(_) => return,
+        };
         if self.fetched_snapshot_cache.is_some() {
             self.push_to_replay_cache(event_batch);
-        } else {
+        } else if height > self.installed_height {
             self.mark_desynced("late_backfill");
         }
     }
@@ -2411,6 +2422,17 @@ mod tests {
             listener.needs_resync(),
             "a backfill batch arriving after the replay cache is gone cannot be applied safely"
         );
+    }
+
+    #[test]
+    fn test_late_backfill_covered_by_the_snapshot_is_not_loss() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(32);
+        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        listener.init_from_snapshot(Snapshots::new(HashMap::new()), 100);
+        listener.cache_backfill_batch(EventBatch::Orders(make_status_batch("BTC", 1, 99)));
+        assert!(!listener.needs_resync(), "a batch at or below the snapshot height is already in the book");
+        listener.cache_backfill_batch(EventBatch::Orders(make_status_batch("BTC", 2, 101)));
+        assert!(listener.needs_resync(), "a batch above the snapshot height was never applied");
     }
 
     // ==================== Resync damping ====================

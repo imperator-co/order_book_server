@@ -13,6 +13,9 @@ use clap::ValueEnum;
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
 
+/// The node's info server (`hl-node ... --serve-info`), used by `SnapshotMode::Info`.
+pub const NODE_INFO_ADDR: &str = "127.0.0.1:3001";
+
 /// Snapshot fetching mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum SnapshotMode {
@@ -21,6 +24,12 @@ pub enum SnapshotMode {
     Docker,
     /// Call hl-node directly (for systemctl/bare metal setups)
     Direct,
+    /// Ask the running node's info server (`--serve-info`) for a snapshot of
+    /// its current state, with that state's height. The NODE process writes
+    /// the snapshot output path, so it must be a path both processes see (not
+    /// a `PrivateTmp=true` /tmp; with the node in Docker, a shared volume
+    /// mounted at the same path)
+    Info,
 }
 
 /// Server configuration passed from CLI arguments
