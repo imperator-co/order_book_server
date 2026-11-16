@@ -216,10 +216,11 @@ lazy_static! {
 
     // ==================== RESYNC & LOCK METRICS ====================
 
-    /// Wall-clock duration of each re-sync phase. `fetch_dump` is the hl-node
-    /// CLI dump, `parse` the snapshot JSON deserialize, `build` the replacement
-    /// book construction, `chase` the off-lock replay loop, `commit` the final
-    /// under-lock swap, and `total` the whole fetch-to-install cycle.
+    /// Wall-clock duration of each re-sync phase. `fetch_dump` produces the
+    /// snapshot file (the hl-node CLI dump or the info server's), `parse` the
+    /// snapshot JSON deserialize, `build` the replacement book construction,
+    /// `chase` the off-lock replay loop, `commit` the final under-lock swap,
+    /// and `total` the whole fetch-to-install cycle.
     pub static ref RESYNC_PHASE_DURATION: HistogramVec = HistogramVec::new(
         HistogramOpts::new("resync_phase_duration_seconds", "Duration of snapshot re-sync phases")
             .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]),

@@ -267,6 +267,25 @@ where
     O: TryFrom<R, Error = Error> + Send + 'static,
     R: Serialize + for<'a> Deserialize<'a> + Send + 'static,
 {
+    load_snapshots(snapshot_path, Some(height)).await
+}
+
+/// Load a snapshot written by the node's info server with
+/// `includeHeightInOutput`: `[height, markets]`. The height is the exact
+/// height of the content, so it is the replay cutoff as is.
+pub(crate) async fn load_snapshots_with_height<O, R>(snapshot_path: &Path) -> Result<(u64, Snapshots<O>, Vec<O>)>
+where
+    O: TryFrom<R, Error = Error> + Send + 'static,
+    R: Serialize + for<'a> Deserialize<'a> + Send + 'static,
+{
+    load_snapshots(snapshot_path, None).await
+}
+
+async fn load_snapshots<O, R>(snapshot_path: &Path, height: Option<u64>) -> Result<(u64, Snapshots<O>, Vec<O>)>
+where
+    O: TryFrom<R, Error = Error> + Send + 'static,
+    R: Serialize + for<'a> Deserialize<'a> + Send + 'static,
+{
     // The snapshot file is hundreds of MB; deserialize + convert is seconds of
     // pure CPU, so it runs on a blocking thread instead of pinning a runtime
     // worker for the duration. Streaming from the file (instead of reading it
@@ -277,7 +296,10 @@ where
     let parsed = tokio::task::spawn_blocking(move || -> Result<(u64, Snapshots<O>, Vec<O>)> {
         let file = fs::File::open(&snapshot_path)?;
         let reader = std::io::BufReader::with_capacity(1 << 20, file);
-        let snapshot: Vec<(String, CliMarket<R>)> = serde_json::from_reader(reader)?;
+        let (height, snapshot): (u64, Vec<(String, CliMarket<R>)>) = match height {
+            Some(height) => (height, serde_json::from_reader(reader)?),
+            None => serde_json::from_reader(reader)?,
+        };
         convert_cli_snapshot(snapshot, height)
     })
     .await??;
@@ -673,5 +695,25 @@ mod tests {
         assert_eq!(bids.len() + asks.len(), 3);
 
         assert!(books.snapshot_for_coin(&Coin::new("DOGE"), band).is_none(), "unknown coin yields None");
+    }
+
+    #[tokio::test]
+    async fn test_info_snapshot_carries_its_own_height() -> Result<()> {
+        create_dir_all("tmp/info_snapshot_test")?;
+        let path = PathBuf::from("tmp/info_snapshot_test/out.json");
+        // [height, markets], either market shape
+        let markets = r#"[["BTC", {"book_orders": [[], []], "untriggered_orders": []}], ["ETH", [[], []]]]"#;
+        fs::write(&path, format!("[1223070943, {markets}]"))?;
+        let (height, snapshots, _) =
+            super::load_snapshots_with_height::<InnerL4Order, (Address, L4Order)>(&path).await?;
+        assert_eq!(height, 1_223_070_943);
+        assert_eq!(snapshots.value().len(), 2);
+
+        // The CLI dump has no height: the caller supplies the cutoff
+        fs::write(&path, markets)?;
+        let (height, ..) = super::load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&path, 7).await?;
+        assert_eq!(height, 7);
+        assert!(super::load_snapshots_with_height::<InnerL4Order, (Address, L4Order)>(&path).await.is_err());
+        Ok(())
     }
 }

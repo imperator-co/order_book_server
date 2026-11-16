@@ -53,9 +53,10 @@ struct Args {
     markets: Markets,
 
     // ========== Snapshot Configuration ==========
-    /// Snapshot fetching mode: docker or direct
+    /// Snapshot fetching mode: docker, direct or info
     /// - docker: Use 'docker exec <container> hl-node ...' (for Docker users)
     /// - direct: Call 'hl-node ...' directly (for systemctl/bare metal users)
+    /// - info: Ask the running node's info server (needs the node's --serve-info)
     #[arg(long, value_enum, default_value = "docker")]
     snapshot_mode: SnapshotMode,
 
@@ -201,6 +202,9 @@ async fn main() -> Result<()> {
     match config.snapshot_mode {
         SnapshotMode::Docker => {
             println!("  Container: {}", config.docker_container);
+        }
+        SnapshotMode::Info => {
+            println!("  Node info server: {}", server::NODE_INFO_ADDR);
         }
         SnapshotMode::Direct => {
             println!("  hl-node binary: {}", config.hlnode_binary);

@@ -10,7 +10,7 @@ use crate::{
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
-        multi_book::{Snapshots, load_snapshots_from_cli_json},
+        multi_book::{Snapshots, load_snapshots_from_cli_json, load_snapshots_with_height},
     },
     prelude::*,
     types::{
@@ -87,13 +87,15 @@ fn fetch_snapshot(
         // cutoff by the whole dump window and silently discarded every cached
         // add/cancel inside it - permanent anchor holes and phantom orders,
         // re-seeded at every install.
-        let visor_path = get_visor_path(&snapshot_config);
-        let pre_dump_height = read_visor_height(&visor_path);
+        // Info mode needs no outside cutoff: its snapshot carries its own, exact height.
+        let info_mode = snapshot_config.mode == crate::SnapshotMode::Info;
+        let pre_dump_height = if info_mode { None } else { read_visor_height(&get_visor_path(&snapshot_config)) };
 
         // Now generate snapshot - any events during this time are cached
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
                 let snapshot = match pre_dump_height {
+                    _ if info_mode => load_snapshots_with_height::<InnerL4Order, (Address, L4Order)>(&output_fln).await,
                     Some(height) => {
                         load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, height).await
                     }
