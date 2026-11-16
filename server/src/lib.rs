@@ -71,4 +71,22 @@ pub struct ServerConfig {
     /// peak event rate or every market-hours re-sync overflows into another
     /// re-sync. 0 = keep the built-in default.
     pub replay_cache_events: usize,
+    /// Slots in the broadcast channel that fans every event out to all
+    /// connections. A connection that falls this many messages behind loses
+    /// the overflow (`channel_drops_total`). 0 = keep the built-in default
+    /// ([`DEFAULT_BROADCAST_CAPACITY`]).
+    pub broadcast_capacity: usize,
 }
+
+/// Default broadcast channel capacity, sized from mainnet traffic (perps,
+/// 2026-11): the listener emits one message per node event, ~42k events/s on
+/// average (statuses + diffs), up to ~105k in one second and ~18k in a single
+/// block. A connection whose socket stalls is dropped after `WS_SEND_TIMEOUT`
+/// (5 s), so the channel must hold 5 s of peak traffic: ~170k messages with
+/// bbo/l2Book subscribers (BboUpdate ~18k/s mean, 44k/s peak), ~570k once an
+/// l4Book/bookDiffs/orderUpdates subscriber adds the per-event L4 messages.
+/// 2^20 covers the latter with ~1.8x headroom. Slots cost ~40 B each up
+/// front; queued messages (measured ~1.7 KB each for the bbo/l2 mix, ~2.6 KB
+/// with L4) are only held while some connection is behind, so a full channel
+/// costs ~1.8-2.7 GB at worst.
+pub const DEFAULT_BROADCAST_CAPACITY: usize = 1 << 20;

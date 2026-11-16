@@ -124,6 +124,13 @@ struct Args {
     /// drops the cache, installs a gapped book, and forces another re-sync.
     #[arg(long, default_value = "4000000")]
     replay_cache_events: usize,
+
+    /// Broadcast channel capacity, in messages: how far one connection may fall
+    /// behind the event stream (one message per node event) before it loses
+    /// messages (counted in channel_drops_total). Memory is only held while a
+    /// connection lags; see the README for sizing.
+    #[arg(long, default_value_t = server::DEFAULT_BROADCAST_CAPACITY)]
+    broadcast_capacity: usize,
 }
 
 /// Start the Prometheus metrics HTTP server
@@ -188,6 +195,7 @@ async fn main() -> Result<()> {
         bbo_heartbeat_ms: args.bbo_heartbeat_ms,
         no_resync: args.no_resync,
         replay_cache_events: args.replay_cache_events,
+        broadcast_capacity: args.broadcast_capacity,
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
