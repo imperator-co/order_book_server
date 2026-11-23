@@ -241,7 +241,7 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
 /// Cap on present-but-uncached coins backfilled per flush. After a snapshot
 /// install (or an active-shape change) clears the cache, the full universe
 /// would otherwise be rebuilt in one rayon burst while the listener lock is
-/// held; the cap spreads that backfill across a few throttle windows.
+/// held; the cap spreads that backfill across a few per-block flushes.
 /// Uncapped coins are re-detected as uncached and picked up by subsequent
 /// flushes, so convergence is automatic. Dirty coins are never capped: a
 /// coin that actually changed must not be served stale.
@@ -253,7 +253,7 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     active: &HashSet<L2SnapshotParams>,
     cache: &mut HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
 ) -> (L2Snapshots, HashSet<Coin>, bool) {
-    /// Below this many dirty coins (the common case is 1-3 per 50ms flush),
+    /// Below this many dirty coins (the common case is a few per block),
     /// rayon's task-dispatch overhead exceeds the rebuild work itself.
     const PAR_COMPUTE_THRESHOLD: usize = 8;
 

@@ -48,12 +48,22 @@ lazy_static! {
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0])
     ).expect("metric can be created");
 
-    /// Number of coins rebuilt per L2 broadcast (conflation batch size). Tracks how
-    /// many coins changed within each 50ms throttle window; spikes toward the
-    /// universe size indicate full-universe windows (lock-duration pressure).
+    /// Number of coins rebuilt per L2 broadcast (one broadcast per block). Spikes
+    /// toward the universe size indicate full-universe rebuilds (lock-duration
+    /// pressure).
     pub static ref L2_CONFLATION_BATCH_SIZE: Histogram = Histogram::with_opts(
         HistogramOpts::new("l2_conflation_batch_size", "Coins rebuilt per L2 broadcast")
             .buckets(vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 150.0])
+    ).expect("metric can be created");
+
+    /// Per-block l2Book flushes (counted per ended block, also when nobody
+    /// subscribes to l2Book) by the signal that ended the block: block_end
+    /// (node_fast_block_times line), next_block (first diff line of a higher
+    /// block), timeout (no end signal in time), late (diff lines that arrived
+    /// after their block's end signal).
+    pub static ref L2_BLOCK_FLUSH_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("l2_block_flush_total", "Per-block l2Book flushes by end-of-block signal"),
+        &["trigger"]
     ).expect("metric can be created");
 
     /// Event processing latency by type
@@ -290,6 +300,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(BBO_BROADCAST_LATENCY.clone())).ok();
     REGISTRY.register(Box::new(L2_BROADCAST_LATENCY.clone())).ok();
     REGISTRY.register(Box::new(L2_CONFLATION_BATCH_SIZE.clone())).ok();
+    REGISTRY.register(Box::new(L2_BLOCK_FLUSH_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(EVENT_PROCESSING_LATENCY.clone())).ok();
 
     // Throughput metrics

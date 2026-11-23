@@ -190,6 +190,23 @@ Pick a value that matches your downstream stall timer, typically `1000` ms for c
     --data-dir /path/to/data
 ```
 
+### l2Book: one flush per block
+
+The node writes a block as many event lines (`--stream-with-block-info`). `l2Book` is
+broadcast once per block, when the block is complete, for every coin that changed in it -
+the end-of-block book, like the public API (`bbo` is still sent per event). The end of
+block H is the first of:
+
+- the node's `node_fast_block_times/<YYYYMMDD>` line for H (written by `run-non-validator`
+  without any flag, right after the block is applied; ~1 ms after its last diff line);
+- the first diff line of a block above H;
+- 100 ms without a change and without an end signal (safety net).
+
+Lines of a block that arrive after its end signal are flushed after the watcher batch that
+carried them (`late`); if the diff stream lags behind the block-times file (catch-up after
+a stall), flushes therefore follow the watcher batches until it has caught up.
+`l2_block_flush_total{trigger}` counts the flushes by end signal.
+
 ## Recommended Configurations
 
 ### Low Latency Trading

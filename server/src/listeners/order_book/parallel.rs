@@ -32,6 +32,9 @@ pub(crate) enum FileEvent {
     /// The watcher had to discard buffered data (oversized partial line). The
     /// book may have missed events and must be re-synced from a snapshot.
     Desync(EventSource),
+    /// The node finished applying this block (its `node_fast_block_times`
+    /// line): every book diff line of the block has been written.
+    BlockEnd(u64),
 }
 
 /// Cheap block-height extraction without a full JSON parse: streaming lines
@@ -695,6 +698,93 @@ pub(super) fn spawn_file_watcher(
     })
 }
 
+/// The height in a `node_fast_block_times` line (`{"hardfork_version":..,"height":N,..}`).
+fn extract_height(line: &[u8]) -> Option<u64> {
+    const KEY: &[u8] = b"\"height\":";
+    let idx = line.windows(KEY.len()).position(|w| w == KEY)?;
+    let digits = &line[idx + KEY.len()..];
+    let end = digits.iter().position(|c| !c.is_ascii_digit()).unwrap_or(digits.len());
+    std::str::from_utf8(&digits[..end]).ok()?.parse().ok()
+}
+
+/// Tails `<data_dir>/node_fast_block_times/<YYYYMMDD>`, which the node writes
+/// (no flag needed) with one line per block right after applying it, i.e.
+/// after the block's last book diff line. The height of the newest complete
+/// line is sent as [`FileEvent::BlockEnd`], so the listener flushes the
+/// block's l2Book at once instead of waiting for the next block's first
+/// diff. Best-effort: without the directory nothing is sent and the listener
+/// falls back to the next-block and timeout signals.
+struct BlockTimesReader {
+    dir: PathBuf,
+    path: Option<PathBuf>,
+    file: Option<File>,
+    partial: Vec<u8>,
+}
+
+impl BlockTimesReader {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, path: None, file: None, partial: Vec::new() }
+    }
+
+    /// Follow the newest daily file (YYYYMMDD names sort chronologically):
+    /// from EOF on the first open (history is no signal), from the start on a
+    /// rotation (the node has just created it).
+    fn follow_newest(&mut self) {
+        let newest = std::fs::read_dir(&self.dir)
+            .ok()
+            .and_then(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).max());
+        let Some(newest) = newest else { return };
+        if self.path.as_ref() == Some(&newest) {
+            return;
+        }
+        let Ok(mut file) = File::open(&newest) else { return };
+        if self.path.is_none() && file.seek(SeekFrom::End(0)).is_err() {
+            return;
+        }
+        info!("block times: following {newest:?}");
+        self.path = Some(newest);
+        self.file = Some(file);
+        self.partial.clear();
+    }
+
+    /// Height of the newest complete line appended since the last call.
+    fn read_new(&mut self) -> Option<u64> {
+        let file = self.file.as_mut()?;
+        if file.read_to_end(&mut self.partial).ok()? == 0 {
+            return None;
+        }
+        let last_nl = self.partial.iter().rposition(|&c| c == b'\n')?;
+        let height = self.partial[..last_nl].split(|&c| c == b'\n').filter_map(extract_height).max();
+        self.partial.drain(..=last_nl);
+        height
+    }
+}
+
+pub(super) fn spawn_block_times_watcher(
+    dir: PathBuf,
+    tx: tokio::sync::mpsc::Sender<FileEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        info!("block times watcher started for {dir:?}");
+        let mut reader = BlockTimesReader::new(dir);
+        for poll in 0_u64.. {
+            if let Some(height) = reader.read_new() {
+                if tx.blocking_send(FileEvent::BlockEnd(height)).is_err() {
+                    return;
+                }
+            }
+            // A newer daily file is looked for about once a second, after the
+            // current one has been read to its end. Signals missed around the
+            // switch (or while the file is unreadable) only delay a block to the
+            // listener's next-block/timeout fallback.
+            if poll % 1000 == 0 {
+                reader.follow_newest();
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    })
+}
+
 /// Start all 3 file watcher threads, returns receiver for events
 /// Uses *_streaming directories (for --stream-with-block-info mode)
 /// `backfill_min_height` is the startup backfill floor (the node's persisted
@@ -741,6 +831,12 @@ pub(crate) fn start_parallel_file_watchers(
     // Spawn watcher for OrderDiffs
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_streaming(&data_dir);
     info!("OrderDiffs dir: {:?}", order_diffs_dir);
+    // End-of-block signals for the per-block l2Book flush. They share the
+    // diff stream's channel, so a block end is consumed in arrival order with
+    // the diff lines it closes.
+    let block_times_dir = data_dir.join("node_fast_block_times");
+    info!("Block times dir: {:?}", block_times_dir);
+    handles.push(spawn_block_times_watcher(block_times_dir, tx.clone()));
     handles.push(spawn_file_watcher(
         EventSource::OrderDiffs,
         order_diffs_dir,
@@ -756,6 +852,32 @@ pub(crate) fn start_parallel_file_watchers(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_extract_height() {
+        let line = br#"{"hardfork_version":114,"height":1231502373,"evm_block_num":52008798,"apply_duration":0.0001}"#;
+        assert_eq!(extract_height(line), Some(1_231_502_373));
+        assert_eq!(extract_height(br#"{"height":}"#), None);
+        assert_eq!(extract_height(b"garbage"), None);
+    }
+
+    #[test]
+    fn test_block_times_reader_tails_newest_file_and_rotates() {
+        let dir = test_dir("block_times");
+        let day1 = dir.join("20261122");
+        append(&day1, "{\"height\":1}\n");
+        let mut r = BlockTimesReader::new(dir.clone());
+        r.follow_newest();
+        assert_eq!(r.read_new(), None, "history before the first open is no signal");
+        append(&day1, "{\"height\":2}\n{\"height\":3}\n{\"hei");
+        assert_eq!(r.read_new(), Some(3), "newest complete line");
+        append(&day1, "ght\":4}\n");
+        assert_eq!(r.read_new(), Some(4), "a partial line completes on the next read");
+        let day2 = dir.join("20261123");
+        append(&day2, "{\"height\":5}\n");
+        r.follow_newest();
+        assert_eq!(r.read_new(), Some(5), "a rotated-in file is read from its start");
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("obs_watcher_test_{}_{name}", std::process::id()));
