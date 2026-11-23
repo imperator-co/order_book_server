@@ -2,10 +2,10 @@ use crate::{
     listeners::order_book::state::OrderBookState,
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, INSERT_BEFORE_FALLBACK_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE,
-        LAST_EVENT_APPLIED_MS, LISTENER_LOCK_WAIT, ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT,
-        ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT, ORDERBOOK_TIME_MS,
-        ORDERBOOK_UNTRIGGERED_TOTAL, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        FILE_LINES_PARSED_TOTAL, INSERT_BEFORE_FALLBACK_TOTAL, L2_BLOCK_FLUSH_TOTAL, L2_BROADCAST_LATENCY,
+        L2_CONFLATION_BATCH_SIZE, LAST_EVENT_APPLIED_MS, LISTENER_LOCK_WAIT, ORDERBOOK_COINS_COUNT,
+        ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT,
+        ORDERBOOK_TIME_MS, ORDERBOOK_UNTRIGGERED_TOTAL, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
         RESYNC_PHASE_DURATION, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
@@ -37,12 +37,12 @@ use tokio::{
 };
 use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file, read_visor_height};
 
-/// Minimum interval between L2 broadcasts. Caps the broadcast rate at 20/sec; the
-/// conflation buffer accumulates dirty coins between broadcasts.
-const L2_BROADCAST_THROTTLE_MS: u64 = 50;
-/// How often the main loop polls to flush the conflation buffer. Must be << the
-/// throttle so a quiet node between block flushes can never starve the L2 feed
-/// for more than ~throttle + tick.
+/// l2Book is flushed once per block, when the block is complete (see
+/// `OrderBookListener::flush_l2_block`). A block with no end signal this long
+/// after its last change (node stalled, or no node_fast_block_times) is flushed
+/// anyway.
+const L2_BLOCK_FLUSH_TIMEOUT_MS: u64 = 100;
+/// How often the main loop checks that timeout.
 const L2_FLUSH_TICK_MS: u64 = 10;
 /// Default cap on events cached for replay while a snapshot fetch is in
 /// flight (tunable via --replay-cache-events). The cache must absorb the
@@ -366,19 +366,21 @@ pub(crate) struct OrderBookListener {
     // awaiting its counterpart across Fills batches (single-event batches in
     // --stream-with-block-info mode).
     trade_pairer: TradePairer,
-    // Throttle L2 broadcasts to prevent flooding clients
-    last_l2_broadcast: Option<Instant>,
+    // Per-block l2Book flush. `pending_l2_block`: highest block with book changes
+    // not yet flushed; `ended_height`: highest block known to be complete;
+    // `pending_l2_since`: time of the pending block's last change (timeout).
+    pending_l2_block: Option<u64>,
+    ended_height: u64,
+    pending_l2_since: Option<Instant>,
     // Incremental L2 snapshot cache. Each per-coin entry is Arc'd and shared with
     // the broadcast Arc, so unchanged coins cost an atomic bump rather than a
     // full level-vector clone. Invalidated in `finish_install`.
     l2_snapshot_cache: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
-    // Coin-level conflation buffer for throttled L2 broadcasts. Every event unions
-    // its changed_coins here; each L2 broadcast drains the full set so no coin
-    // starves during throttle-suppressed windows. Without this, a coin that changed
-    // during a suppressed 50ms window was never marked for rebuild and served a
-    // stale cached snapshot until a later event for that exact coin happened to land
-    // on an open throttle slot. Mutated only under the listener lock (like
-    // last_l2_broadcast / l2_snapshot_cache). Bounded by the universe size.
+    // Coin-level buffer for the per-block L2 broadcast. Every event unions its
+    // changed_coins here; each L2 broadcast drains the full set. Kept (not
+    // drained) while nobody subscribes to l2Book, so the cache is rebuilt for
+    // every coin that changed meanwhile. Mutated only under the listener lock
+    // (like l2_snapshot_cache). Bounded by the universe size.
     pending_dirty_l2_coins: HashSet<Coin>,
     // Shared registry of L2 variant shapes any live connection wants. Read at flush
     // time so we compute only subscribed variants per coin instead of all 7.
@@ -390,8 +392,8 @@ pub(crate) struct OrderBookListener {
     // The active variant set used for the last L2 build. When it changes (a new
     // shape is subscribed, or the last subscriber of a shape leaves), the cache holds
     // the wrong shapes, so we clear it to force a full rebuild against the new set -
-    // this is what lets a brand-new subscriber be served within one throttle window
-    // even on an otherwise-quiet coin.
+    // this is what lets a brand-new subscriber be served within one block even on
+    // an otherwise-quiet coin.
     last_active_l2_params: HashSet<L2SnapshotParams>,
 }
 
@@ -420,7 +422,9 @@ impl OrderBookListener {
             last_seen_height: 0,
             internal_message_tx,
             trade_pairer: TradePairer::default(),
-            last_l2_broadcast: None,
+            pending_l2_block: None,
+            ended_height: 0,
+            pending_l2_since: None,
             l2_snapshot_cache: HashMap::new(),
             pending_dirty_l2_coins: HashSet::new(),
             active_l2_params,
@@ -1069,6 +1073,14 @@ impl OrderBookListener {
             return;
         };
 
+        // The first diff line of a higher block ends the pending block: flush
+        // its l2Book before this line changes the book.
+        if matches!(event_batch, EventBatch::BookDiffs(_)) && self.pending_l2_block.is_some_and(|block| height > block)
+        {
+            self.ended_height = self.ended_height.max(height - 1);
+            self.flush_l2_block("next_block");
+        }
+
         // Collected here and applied after the state borrow ends.
         let mut desync_reason: Option<&'static str> = None;
 
@@ -1238,57 +1250,59 @@ impl OrderBookListener {
             }
         }
 
-        // Throttled L2 snapshot broadcast for L2Book subscribers.
-        // l2_snapshots_incremental() walks every changed coin x every aggregation
-        // variant, so limit to 20 broadcasts/sec max (50ms).
+        // l2Book is flushed once per block, when the block is complete
+        // (flush_l2_block): a block arrives as many diff lines, and the states
+        // in between are not states of the book. Collect the changed coins.
         // (Heartbeat resend for quiet coins is handled per-connection in handle_socket.)
-        //
-        // Conflation: every event accumulates its changed coins into a persistent
-        // buffer. Because L2 is throttled to one broadcast / 50ms, the buffer holds
-        // EVERY coin that changed since the last broadcast - not just the coins in the
-        // triggering event. Without this, a coin that changed during a throttle-
-        // suppressed window was never marked for rebuild and served a stale cached
-        // snapshot until a later event for that exact coin happened to land on an open
-        // throttle slot (165-2260ms L2 update gaps with many active coins, while BBO -
-        // which reads live state every event - stayed fresh).
-        //
-        // CRITICAL: the receiver_count gate must wrap the compute, not sit between
-        // compute and send. A prior version updated last_l2_broadcast only when
-        // receivers existed, so with zero subscribers the throttle reset never fired
-        // and the par_iter ran on every event - tens of GB of allocator churn per hour
-        // and a pinned listener mutex. We still set last_l2_broadcast unconditionally
-        // below. The buffer is only drained inside the has_receivers + Some(state)
-        // branch where we actually rebuild: draining anywhere else would clear the
-        // coins without refreshing the cache, so a later-connecting subscriber would
-        // be served their stale snapshots. With no subscribers the buffer keeps
-        // accumulating (deduped by coin, bounded by the universe size).
-        self.pending_dirty_l2_coins.extend(changed_coins.iter().cloned());
-        // The L2 broadcast is NOT done inline here. The main event loop calls
-        // flush_l2_if_due() right after this (and a flush ticker backstops quiet
-        // periods), so the broadcast fires the moment the throttle window expires
-        // instead of waiting for the next tick. The event path stays minimal:
-        // apply + BBO + accumulate.
+        if !changed_coins.is_empty() {
+            self.pending_l2_block = Some(self.pending_l2_block.map_or(height, |block| block.max(height)));
+            self.pending_l2_since = Some(Instant::now());
+            self.pending_dirty_l2_coins.extend(changed_coins);
+        }
     }
 
-    /// Flush the L2 conflation buffer if the throttle window has elapsed and there
-    /// are dirty coins. Driven by the main-loop flush ticker so the L2 feed has a
-    /// guaranteed maximum interval (~throttle + tick) regardless of event arrival.
-    /// Safe to call on every tick: O(1) early-return when not due. Runs under the
-    /// listener lock.
-    pub(crate) fn flush_l2_if_due(&mut self) {
-        let should_broadcast_l2 = !self.pending_dirty_l2_coins.is_empty()
-            && self
-                .last_l2_broadcast
-                .map(|t| t.elapsed() >= Duration::from_millis(L2_BROADCAST_THROTTLE_MS))
-                .unwrap_or(true);
-        if !should_broadcast_l2 {
+    /// The node finished block `height` (its node_fast_block_times line).
+    pub(crate) fn on_block_end(&mut self, height: u64) {
+        self.ended_height = self.ended_height.max(height);
+        if self.pending_l2_block.is_some_and(|block| block <= self.ended_height) {
+            self.flush_l2_block("block_end");
+        }
+    }
+
+    /// After each batch of watcher events: flush diff lines that arrived after
+    /// their block's end signal (the end signal and the diffs are separate
+    /// files, so the end can overtake the last lines).
+    pub(crate) fn flush_l2_late_lines(&mut self) {
+        if self.pending_l2_block.is_some_and(|block| block <= self.ended_height) {
+            self.flush_l2_block("late");
+        }
+    }
+
+    /// Safety net: flush a block whose end signal is overdue.
+    pub(crate) fn flush_l2_if_overdue(&mut self) {
+        if self.pending_l2_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(L2_BLOCK_FLUSH_TIMEOUT_MS)) {
+            self.flush_l2_block("timeout");
+        }
+    }
+
+    /// One l2Book broadcast for every coin changed in the pending block, at the
+    /// end of the block. Runs under the listener lock.
+    ///
+    /// CRITICAL: the receiver gate must wrap the compute. The buffer is only
+    /// drained where we actually rebuild: draining anywhere else would clear
+    /// the coins without refreshing the cache, so a later-connecting
+    /// subscriber would be served stale snapshots. With no subscribers the
+    /// buffer keeps accumulating (deduped by coin, bounded by the universe).
+    fn flush_l2_block(&mut self, trigger: &'static str) {
+        if self.pending_l2_block.take().is_none() {
             return;
         }
-
+        self.pending_l2_since = None;
+        L2_BLOCK_FLUSH_TOTAL.with_label_values(&[trigger]).inc();
+        if self.pending_dirty_l2_coins.is_empty() {
+            return;
+        }
         let has_receivers = self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0);
-        // Mark the throttle as fired regardless of receivers so we don't re-run the
-        // par_iter path on every subsequent tick when nobody is listening.
-        self.last_l2_broadcast = Some(Instant::now());
         if !has_receivers {
             return;
         }
@@ -1301,14 +1315,14 @@ impl OrderBookListener {
         }
         // When the requested shape set changes, the cache holds the wrong shapes;
         // clear it so every present coin is rebuilt with the new set on this flush
-        // (bounds a new subscriber's wait to one throttle window even on quiet coins).
+        // (bounds a new subscriber's wait to one block even on quiet coins).
         if active != self.last_active_l2_params {
             self.l2_snapshot_cache.clear();
             self.last_active_l2_params.clone_from(&active);
         }
 
         if let Some(state) = &self.order_book_state {
-            // Drain the conflation buffer only now that we will actually rebuild.
+            // Drain the buffer only now that we will actually rebuild.
             // mem::take yields an owned set, releasing the borrow on
             // self.pending_dirty_l2_coins before the disjoint co-borrow of
             // order_book_state (&) and l2_snapshot_cache (&mut).
@@ -1618,9 +1632,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let mut resync_backoff = RESYNC_BACKOFF_BASE;
     let mut next_fetch_allowed = Instant::now();
 
-    // Drives L2 broadcasts on a fixed cadence so the feed has a guaranteed maximum
-    // interval even when no events arrive. Skip missed ticks so a busy loop resumes
-    // on the next aligned tick rather than firing a catch-up burst.
+    // Checks the per-block l2Book flush timeout. Skip missed ticks so a busy
+    // loop resumes on the next aligned tick rather than firing a catch-up burst.
     let mut l2_flush_ticker = interval(Duration::from_millis(L2_FLUSH_TICK_MS));
     l2_flush_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -1638,6 +1651,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     enum Action {
         Apply(u64, EventBatch, EventSource),
         Backfill(EventBatch),
+        BlockEnd(u64),
         Desync,
     }
 
@@ -1647,17 +1661,15 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         tokio::select! {
             biased;
 
-            // L2 flush FIRST under `biased`: guarantees the throttle window is
-            // serviced even under continuous event load. During a burst tokio_rx is
-            // perpetually ready, so a later-placed flush arm would be starved and the
-            // multi-second gaps would return. flush_l2_if_due() is O(1) when not due
-            // and the tick is only Ready every L2_FLUSH_TICK_MS, so it cannot starve
-            // the event arm in return.
+            // Timeout check FIRST under `biased`: during a burst tokio_rx is
+            // perpetually ready, so a later-placed arm would be starved. It is
+            // O(1) and only Ready every L2_FLUSH_TICK_MS, so it cannot starve the
+            // event arm in return.
             _ = l2_flush_ticker.tick() => {
                 let lock_start = Instant::now();
                 let mut guard = listener.lock().await;
                 LISTENER_LOCK_WAIT.observe(lock_start.elapsed().as_secs_f64());
-                guard.flush_l2_if_due();
+                guard.flush_l2_if_overdue();
             }
 
             // Process events from the file watchers, draining up to
@@ -1682,6 +1694,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         parallel::FileEvent::Fill(line) => (line, EventSource::Fills, false),
                         parallel::FileEvent::BackfillOrderDiff(line) => (line, EventSource::OrderDiffs, true),
                         parallel::FileEvent::BackfillOrderStatus(line) => (line, EventSource::OrderStatuses, true),
+                        parallel::FileEvent::BlockEnd(height) => {
+                            actions.push(Action::BlockEnd(height));
+                            continue;
+                        }
                         parallel::FileEvent::Desync(source) => {
                             // The watcher discarded data (oversized partial line);
                             // the book can no longer be trusted - trigger a re-sync.
@@ -1708,13 +1724,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         match action {
                             Action::Apply(height, batch, source) => guard.apply_event_batch(height, batch, source),
                             Action::Backfill(batch) => guard.cache_backfill_batch(batch),
+                            Action::BlockEnd(height) => guard.on_block_end(height),
                             Action::Desync => guard.mark_desynced("watcher_data_loss"),
                         }
                     }
-                    // The inline flush broadcasts the instant the L2 throttle
-                    // window expires (O(1) when not due) instead of waiting for
-                    // the next flush tick.
-                    guard.flush_l2_if_due();
+                    guard.flush_l2_late_lines();
                 }
             }
 
@@ -1854,54 +1868,113 @@ mod tests {
         assert!(asks.is_empty());
     }
 
-    #[test]
-    fn test_flush_l2_if_due_broadcasts_and_drains_when_due() {
-        let (mut listener, mut rx) = ready_listener();
-        // A subscriber must want at least one variant shape, else flush is skipped.
-        let _guard = listener.active_l2_params().acquire(L2SnapshotParams::new(None, None));
-        listener.pending_dirty_l2_coins.insert(Coin::new("BTC"));
-        listener.last_l2_broadcast = None; // due (no prior broadcast)
+    /// Coin sets of the l2Book (Snapshot) broadcasts so far.
+    fn l2_flushes(rx: &mut tokio::sync::broadcast::Receiver<Arc<InternalMessage>>) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let InternalMessage::Snapshot { dirty, .. } = msg.as_ref() {
+                let mut v: Vec<String> = dirty.iter().map(Coin::value).collect();
+                v.sort();
+                out.push(v);
+            }
+        }
+        out
+    }
 
-        listener.flush_l2_if_due();
+    fn l2_subscribed_listener()
+    -> (OrderBookListener, tokio::sync::broadcast::Receiver<Arc<InternalMessage>>, L2ParamGuard) {
+        let (listener, rx) = ready_listener();
+        let guard = listener.active_l2_params().acquire(L2SnapshotParams::new(None, None));
+        (listener, rx, guard)
+    }
 
-        let msg = rx.try_recv().expect("a Snapshot must be broadcast when due and dirty");
-        assert!(matches!(msg.as_ref(), InternalMessage::Snapshot { .. }));
-        assert!(listener.pending_dirty_l2_coins.is_empty(), "buffer is drained on flush");
-        assert!(listener.last_l2_broadcast.is_some(), "throttle timestamp is set");
+    fn update_sz(listener: &mut OrderBookListener, coin: &str, oid: u64, height: u64, from: &str, to: &str) {
+        let update = make_diff_batch(coin, oid, height, serde_json::json!({"update": {"origSz": from, "newSz": to}}));
+        listener.apply_event_batch(height, EventBatch::BookDiffs(update), EventSource::OrderDiffs);
     }
 
     #[test]
-    fn test_flush_l2_if_due_noop_inside_throttle_window() {
-        let (mut listener, mut rx) = ready_listener();
-        listener.pending_dirty_l2_coins.insert(Coin::new("BTC"));
-        listener.last_l2_broadcast = Some(Instant::now()); // just fired -> not due
+    fn test_l2_flushed_once_when_the_next_block_starts() {
+        let (mut listener, mut rx, _g) = l2_subscribed_listener();
+        feed_order(&mut listener, "BTC", 1, 5);
+        update_sz(&mut listener, "BTC", 1, 5, "1.0", "2.0");
+        feed_order(&mut listener, "ETH", 2, 5);
+        assert!(l2_flushes(&mut rx).is_empty(), "nothing is flushed inside a block");
 
-        listener.flush_l2_if_due();
-
-        assert!(rx.try_recv().is_err(), "nothing is broadcast inside the throttle window");
-        assert!(!listener.pending_dirty_l2_coins.is_empty(), "buffer is retained when not due");
+        // The first diff line of block 6 flushes block 5 (before applying itself).
+        feed_order(&mut listener, "SOL", 3, 6);
+        let flushes = l2_flushes(&mut rx);
+        assert_eq!(flushes.len(), 1, "one l2Book broadcast for block 5");
+        assert!(flushes[0].contains(&"BTC".to_string()) && flushes[0].contains(&"ETH".to_string()));
+        assert!(!flushes[0].contains(&"SOL".to_string()), "block 6 is not part of block 5's flush");
+        assert_eq!(listener.pending_l2_block, Some(6));
     }
 
     #[test]
-    fn test_flush_l2_if_due_noop_when_buffer_empty() {
-        let (mut listener, mut rx) = ready_listener();
-        listener.last_l2_broadcast = None; // due, but nothing dirty
-
-        listener.flush_l2_if_due();
-
-        assert!(rx.try_recv().is_err(), "no broadcast when there are no dirty coins");
+    fn test_l2_block_end_signal_flushes_once() {
+        let (mut listener, mut rx, _g) = l2_subscribed_listener();
+        feed_order(&mut listener, "BTC", 1, 5);
+        listener.on_block_end(4);
+        assert!(l2_flushes(&mut rx).is_empty(), "an older block's end does not flush");
+        listener.on_block_end(5);
+        assert_eq!(l2_flushes(&mut rx).len(), 1);
+        listener.on_block_end(5);
+        listener.flush_l2_late_lines();
+        assert!(l2_flushes(&mut rx).is_empty(), "a block is flushed once");
     }
 
     #[test]
-    fn test_flush_l2_if_due_noop_when_no_active_variants() {
-        // Due + dirty + receiver, but no connection wants any L2 variant.
+    fn test_l2_lines_after_their_block_end() {
+        // The end signal and the diffs are separate files: lines of an ended
+        // block that arrive after its end signal are flushed after the watcher
+        // batch that carried them, not held for the next block.
+        let (mut listener, mut rx, _g) = l2_subscribed_listener();
+        listener.on_block_end(5);
+        feed_order(&mut listener, "BTC", 1, 5);
+        update_sz(&mut listener, "BTC", 1, 5, "1.0", "3.0");
+        assert!(l2_flushes(&mut rx).is_empty());
+        listener.flush_l2_late_lines();
+        assert_eq!(l2_flushes(&mut rx).len(), 1);
+        // A block that has not ended is not flushed by the batch-end check.
+        feed_order(&mut listener, "BTC", 2, 6);
+        listener.flush_l2_late_lines();
+        assert!(l2_flushes(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn test_l2_flushed_on_timeout_without_an_end_signal() {
+        let (mut listener, mut rx, _g) = l2_subscribed_listener();
+        feed_order(&mut listener, "BTC", 1, 5);
+        listener.flush_l2_if_overdue();
+        assert!(l2_flushes(&mut rx).is_empty(), "not before the timeout");
+        listener.pending_l2_since = Some(Instant::now() - Duration::from_millis(L2_BLOCK_FLUSH_TIMEOUT_MS + 1));
+        listener.flush_l2_if_overdue();
+        assert_eq!(l2_flushes(&mut rx).len(), 1);
+        assert_eq!(listener.pending_l2_block, None);
+    }
+
+    #[test]
+    fn test_l2_buffer_kept_when_no_active_variants() {
+        // No connection wants any L2 variant: nothing is built, and the buffer
+        // is kept so a later subscriber gets fresh snapshots.
         let (mut listener, mut rx) = ready_listener();
-        listener.pending_dirty_l2_coins.insert(Coin::new("BTC"));
-        listener.last_l2_broadcast = None;
+        feed_order(&mut listener, "BTC", 1, 5);
+        listener.on_block_end(5);
+        assert!(l2_flushes(&mut rx).is_empty(), "no broadcast when no variant shape is subscribed");
+        assert!(!listener.pending_dirty_l2_coins.is_empty(), "buffer is kept while unsubscribed");
+    }
 
-        listener.flush_l2_if_due();
-
-        assert!(rx.try_recv().is_err(), "no broadcast when no variant shape is subscribed");
+    #[test]
+    fn test_bbo_still_sent_per_event() {
+        let (mut listener, mut rx) = ready_listener();
+        let _bbo = listener.active_subs().acquire_for(&Subscription::Bbo { coin: "BTC".to_string() });
+        feed_order(&mut listener, "BTC", 1, 5);
+        update_sz(&mut listener, "BTC", 1, 5, "1.0", "2.0");
+        let mut bbos = 0;
+        while let Ok(msg) = rx.try_recv() {
+            bbos += usize::from(matches!(msg.as_ref(), InternalMessage::BboUpdate { .. }));
+        }
+        assert_eq!(bbos, 2, "bbo is unchanged: one per changed diff line");
     }
 
     // ==================== Event helpers ====================
@@ -2778,8 +2851,7 @@ mod tests {
 
         // First flush after BTC appears: dirty contains BTC, universe included.
         feed_order(&mut listener, "BTC", 1, 1);
-        listener.last_l2_broadcast = None;
-        listener.flush_l2_if_due();
+        listener.on_block_end(1);
         let (dirty, universe) = next_snapshot_msg(&mut rx);
         assert!(dirty.contains("BTC"));
         let universe = universe.expect("universe must be included when the coin set changes");
@@ -2789,8 +2861,7 @@ mod tests {
         // so no universe is attached.
         let update = make_diff_batch("BTC", 1, 2, serde_json::json!({"update": {"origSz": "1.0", "newSz": "2.0"}}));
         listener.apply_event_batch(2, EventBatch::BookDiffs(update), EventSource::OrderDiffs);
-        listener.last_l2_broadcast = None;
-        listener.flush_l2_if_due();
+        listener.on_block_end(2);
         let (dirty, universe) = next_snapshot_msg(&mut rx);
         assert!(dirty.contains("BTC"));
         assert!(universe.is_none(), "universe is only rebuilt when the coin set changes");
